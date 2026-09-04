@@ -9,6 +9,7 @@ import gzip
 import shutil
 import concurrent.futures
 import html as html_lib
+import io
 from datetime import datetime, timedelta, timezone
 
 # ============================================================
@@ -48,6 +49,7 @@ if not os.path.exists(DATA_DIR):
 TOKEN_FILE = os.path.join(DATA_DIR, 'token.json')
 LTP_CACHE_FILE = os.path.join(DATA_DIR, 'ltp_cache.json')
 POSITIONS_FILE = os.path.join(DATA_DIR, 'hedge_positions.json')
+TELEGRAM_CONFIG_FILE = os.path.join(DATA_DIR, 'telegram_config.json')
 NSE_JSON_PATH = 'NSE.json'
 
 
@@ -72,6 +74,40 @@ def save_token(token):
             json.dump({'date': get_ist_now().strftime('%Y-%m-%d'), 'token': token}, f)
     except Exception:
         pass
+
+
+# ============================================================
+# Telegram alerts
+# ============================================================
+def load_telegram_config():
+    if os.path.exists(TELEGRAM_CONFIG_FILE):
+        try:
+            with open(TELEGRAM_CONFIG_FILE, 'r') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {'bot_token': '', 'chat_id': '', 'enabled': False}
+
+
+def save_telegram_config(cfg):
+    try:
+        with open(TELEGRAM_CONFIG_FILE, 'w') as f:
+            json.dump(cfg, f)
+    except Exception:
+        pass
+
+
+def send_telegram_message(bot_token, chat_id, text):
+    if not bot_token or not chat_id:
+        return False, "Bot Token / Chat ID missing"
+    try:
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        resp = requests.post(url, data={'chat_id': chat_id, 'text': text}, timeout=8)
+        if resp.status_code == 200:
+            return True, "ok"
+        return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
+    except Exception as e:
+        return False, str(e)
 
 
 # ============================================================
@@ -247,6 +283,21 @@ with st.sidebar:
             st.error(f"Error: {e}")
 
     st.markdown("---")
+    st.header("Telegram Alerts")
+    tg_cfg = load_telegram_config()
+    tg_bot_token = st.text_input("Bot Token", value=tg_cfg.get('bot_token', ''), type="password")
+    tg_chat_id = st.text_input("Chat ID", value=tg_cfg.get('chat_id', ''))
+    tg_enabled = st.checkbox(
+        "Enable Alerts (TGT hit, profit% ≥ 50%, profit% ≤ -30%)",
+        value=tg_cfg.get('enabled', False)
+    )
+    if (tg_bot_token, tg_chat_id, tg_enabled) != (tg_cfg.get('bot_token', ''), tg_cfg.get('chat_id', ''), tg_cfg.get('enabled', False)):
+        save_telegram_config({'bot_token': tg_bot_token, 'chat_id': tg_chat_id, 'enabled': tg_enabled})
+    if st.button("Send Test Message", use_container_width=True):
+        ok, msg = send_telegram_message(tg_bot_token, tg_chat_id, "✅ Hedge PNL Tracker: test alert.")
+        st.success("Sent.") if ok else st.error(f"Failed: {msg}")
+
+    st.markdown("---")
     st.header("Auto Refresh")
     auto_refresh = st.checkbox("Enable Auto-Refresh", value=False)
     refresh_interval = st.slider("Refresh Interval (seconds)", min_value=5, max_value=60, value=15)
@@ -370,6 +421,9 @@ open_legs = 0
 total_invest = 0.0
 total_profit = 0.0
 body_rows_html = []
+export_rows = []
+alerts_changed = False
+alert_failures = []
 
 for pos_idx, p in enumerate(positions):
     lot = p.get('lot_size') or 0
@@ -390,6 +444,7 @@ for pos_idx, p in enumerate(positions):
             'strike': p[f'{leg}_strike'], 'qty': qty, 'entry': entry, 'ltp': ltp,
             'tgt': tgt, 'exit': exit_, 'points': points, 'invest': invest,
             'profit': profit, 'is_open': is_open,
+            'tgt_hit': tgt > 0 and is_open and ltp >= tgt,
         }
 
     net_invest = leg_calc['ce']['invest'] + leg_calc['pe']['invest']
@@ -397,10 +452,52 @@ for pos_idx, p in enumerate(positions):
     if net_profit == 0:
         net_profit = 0.0  # avoid displaying "-0"
     net_pct = (net_profit / net_invest * 100) if net_invest else 0.0
+    pos_open_legs = int(leg_calc['ce']['is_open']) + int(leg_calc['pe']['is_open'])
 
-    open_legs += int(leg_calc['ce']['is_open']) + int(leg_calc['pe']['is_open'])
+    open_legs += pos_open_legs
     total_invest += net_invest
     total_profit += net_profit
+
+    # --- Telegram alerts: TGT hit / profit% >= 50 / profit% <= -30 ---
+    # Only actually fires (and only then marks itself "consumed") once
+    # Alerts are enabled — leaving alerts off never burns an alert flag,
+    # so turning them on later still fires for a condition already true.
+    # A Save in the edit form clears the flags so alerts can fire again
+    # after the numbers change.
+    if tg_enabled:
+        for leg in ('ce', 'pe'):
+            lc = leg_calc[leg]
+            if lc['tgt_hit'] and not p.get(f'{leg}_tgt_alerted'):
+                ok, msg = send_telegram_message(
+                    tg_bot_token, tg_chat_id,
+                    f"🎯 TGT HIT — {p['symbol']} {lc['strike']:.0f} {leg.upper()} "
+                    f"(S.no {p['sno']})\nLTP {lc['ltp']:.2f} reached target {lc['tgt']:.2f}"
+                )
+                if not ok:
+                    alert_failures.append(msg)
+                p[f'{leg}_tgt_alerted'] = True
+                alerts_changed = True
+        if pos_open_legs > 0:
+            if net_pct >= 50 and not p.get('profit50_alerted'):
+                ok, msg = send_telegram_message(
+                    tg_bot_token, tg_chat_id,
+                    f"🚀 PROFIT ≥ 50% — {p['symbol']} (S.no {p['sno']})\n"
+                    f"Net Profit ₹{net_profit:,.0f} | PNL {net_pct:.1f}%"
+                )
+                if not ok:
+                    alert_failures.append(msg)
+                p['profit50_alerted'] = True
+                alerts_changed = True
+            if net_pct <= -30 and not p.get('loss30_alerted'):
+                ok, msg = send_telegram_message(
+                    tg_bot_token, tg_chat_id,
+                    f"⚠️ EXIT? PNL ≤ -30% — {p['symbol']} (S.no {p['sno']})\n"
+                    f"Net Profit ₹{net_profit:,.0f} | PNL {net_pct:.1f}%"
+                )
+                if not ok:
+                    alert_failures.append(msg)
+                p['loss30_alerted'] = True
+                alerts_changed = True
 
     entry_date_str = pd.to_datetime(p.get('entry_date'), errors='coerce')
     entry_date_str = entry_date_str.strftime('%d-%m-%Y') if pd.notna(entry_date_str) else '—'
@@ -411,8 +508,7 @@ for pos_idx, p in enumerate(positions):
 
     for i, leg in enumerate(('ce', 'pe')):
         lc = leg_calc[leg]
-        tgt_hit = lc['tgt'] > 0 and lc['ltp'] >= lc['tgt']
-        ltp_style = 'background-color:#0b6623;color:#fff;font-weight:700' if tgt_hit else ''
+        ltp_style = 'background-color:#0b6623;color:#fff;font-weight:700' if lc['tgt_hit'] else ''
         exit_disp = f"{lc['exit']:.2f}" if lc['exit'] is not None else '—'
 
         cells = []
@@ -438,7 +534,23 @@ for pos_idx, p in enumerate(positions):
             cells.append(f'<td rowspan="2" class="{band}">{esc(p.get("remarks") or "")}</td>')
         body_rows_html.append('<tr>' + ''.join(cells) + '</tr>')
 
+        export_rows.append({
+            'S.no': p['sno'], 'Entry Date': entry_date_str, 'SYMBOL': p['symbol'], 'lot Size': lot,
+            'Strike': f"{lc['strike']:.0f} {leg.upper()}", 'Qty': lc['qty'],
+            'entry': lc['entry'], 'LTP': lc['ltp'], 'TGT': lc['tgt'], 'exit': exit_disp,
+            'points': round(lc['points'], 2), 'invest': round(lc['invest'], 2),
+            'profit': round(lc['profit'], 2),
+            'Net Invest': round(net_invest, 2), 'Net Profit': round(net_profit, 2),
+            'profit%': round(net_pct, 2), 'Exit Date': exit_date_str,
+            'remarks': p.get('remarks') or '',
+        })
+
 overall_pct = (total_profit / total_invest * 100) if total_invest else 0.0
+
+if alerts_changed:
+    save_positions(positions)
+if alert_failures:
+    st.warning("Telegram alert failed to send: " + "; ".join(alert_failures[:3]))
 
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Open Legs", open_legs)
@@ -485,6 +597,32 @@ table_html = f"""
 
 st.caption(f"Last Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
 st.markdown(table_html, unsafe_allow_html=True)
+
+# ------------------------------------------------------------
+# Excel download + clear-all
+# ------------------------------------------------------------
+dl_col, clear_col = st.columns(2)
+
+with dl_col:
+    export_buf = io.BytesIO()
+    pd.DataFrame(export_rows).to_excel(export_buf, index=False, sheet_name='Positions', engine='openpyxl')
+    st.download_button(
+        "⬇️ Download as Excel",
+        data=export_buf.getvalue(),
+        file_name=f"hedge_positions_{get_ist_now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+
+with clear_col:
+    with st.popover("🗑️ Clear All Positions", use_container_width=True):
+        st.warning("This deletes every position permanently. This cannot be undone.")
+        confirm_clear = st.checkbox("Yes, I'm sure — clear everything")
+        if st.button("Confirm Clear All", disabled=not confirm_clear, use_container_width=True):
+            save_positions([])
+            st.success("Cleared.")
+            time.sleep(1)
+            st.rerun()
 
 # ------------------------------------------------------------
 # Close / edit a position — plain widgets, no grid editing.
@@ -546,6 +684,9 @@ with st.form("edit_position_form"):
         pos['pe_exit'] = pe_exit_val if pe_exit_val > 0 else None
         pos['exit_date'] = str(exit_date_val) if (ce_exit_val > 0 or pe_exit_val > 0) else None
         pos['remarks'] = remarks_val
+        # Numbers changed — let TGT/profit% alerts re-evaluate from scratch.
+        for flag in ('ce_tgt_alerted', 'pe_tgt_alerted', 'profit50_alerted', 'loss30_alerted'):
+            pos.pop(flag, None)
         save_positions(positions)
         st.success(f"Saved S.no {sel_sno}")
         st.rerun()
