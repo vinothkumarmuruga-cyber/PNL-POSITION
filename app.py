@@ -348,12 +348,15 @@ def leg_ltp(inst_key):
 
 
 # ------------------------------------------------------------
-# Build the display table — two rows (CE, PE) per position, same
-# column layout as before with TGT added right before exit.
+# Build the display table — ONE row per position (CE + PE as a single
+# basket): shared fields (date, symbol, lot) appear once, CE and PE legs
+# sit side by side, and Net Invest / Net Profit / profit% are the
+# combined basket P&L — that combined profit% is "my PNL%".
 # ------------------------------------------------------------
 rows = []
 for p in positions:
     lot = p.get('lot_size') or 0
+    leg_calc = {}
     for leg in ('ce', 'pe'):
         entry = float(p.get(f'{leg}_entry') or 0)
         exit_ = p.get(f'{leg}_exit')
@@ -365,50 +368,66 @@ for p in positions:
         points = (effective_exit - entry) * qty
         invest = entry * lot * qty
         profit = points * lot
-        rows.append({
-            'S.no': p['sno'],
-            'Entry Date': p.get('entry_date'),
-            'SYMBOL': p['symbol'],
-            'STRIKE': f"{p[f'{leg}_strike']:.0f} {leg.upper()}",
-            'lot Size': lot,
-            'Qty': qty,
-            'entry': entry,
-            'LTP': ltp,
-            'TGT': float(p.get(f'{leg}_tgt') or 0),
-            'exit': exit_,
-            'points': points,
-            'invest': invest,
-            'profit': profit,
-            'Exit Date': p.get('exit_date'),
-            'remarks': p.get('remarks') or '',
-            '_is_open': is_open,
-        })
+        leg_calc[leg] = {
+            'strike': p[f'{leg}_strike'], 'qty': qty, 'entry': entry, 'ltp': ltp,
+            'tgt': float(p.get(f'{leg}_tgt') or 0), 'exit': exit_,
+            'invest': invest, 'profit': profit, 'is_open': is_open,
+        }
+
+    net_invest = leg_calc['ce']['invest'] + leg_calc['pe']['invest']
+    net_profit = leg_calc['ce']['profit'] + leg_calc['pe']['profit']
+    if net_profit == 0:
+        net_profit = 0.0  # avoid displaying "-0"
+    rows.append({
+        'S.no': p['sno'],
+        'Entry Date': p.get('entry_date'),
+        'SYMBOL': p['symbol'],
+        'lot Size': lot,
+        'CE Strike': f"{leg_calc['ce']['strike']:.0f} CE", 'CE Qty': leg_calc['ce']['qty'],
+        'CE Entry': leg_calc['ce']['entry'], 'CE LTP': leg_calc['ce']['ltp'],
+        'CE TGT': leg_calc['ce']['tgt'],
+        'CE Exit': f"{leg_calc['ce']['exit']:.2f}" if leg_calc['ce']['exit'] is not None else '—',
+        'PE Strike': f"{leg_calc['pe']['strike']:.0f} PE", 'PE Qty': leg_calc['pe']['qty'],
+        'PE Entry': leg_calc['pe']['entry'], 'PE LTP': leg_calc['pe']['ltp'],
+        'PE TGT': leg_calc['pe']['tgt'],
+        'PE Exit': f"{leg_calc['pe']['exit']:.2f}" if leg_calc['pe']['exit'] is not None else '—',
+        'Net Invest': net_invest,
+        'Net Profit': net_profit,
+        'profit%': (net_profit / net_invest * 100) if net_invest else 0.0,
+        'Exit Date': p.get('exit_date'),
+        'remarks': p.get('remarks') or '',
+        '_open_legs': int(leg_calc['ce']['is_open']) + int(leg_calc['pe']['is_open']),
+    })
 
 df = pd.DataFrame(rows)
-totals = df.groupby('S.no')[['invest', 'profit']].transform('sum')
-df['Net Invest'] = totals['invest']
-df['Net Profit'] = totals['profit']
-df['profit%'] = (df['Net Profit'] / df['Net Invest'].replace(0, pd.NA) * 100).fillna(0.0)
 
 display_cols = [
-    'S.no', 'Entry Date', 'SYMBOL', 'STRIKE', 'lot Size', 'Qty',
-    'entry', 'LTP', 'TGT', 'exit', 'points', 'invest', 'profit',
+    'S.no', 'Entry Date', 'SYMBOL', 'lot Size',
+    'CE Strike', 'CE Qty', 'CE Entry', 'CE LTP', 'CE TGT', 'CE Exit',
+    'PE Strike', 'PE Qty', 'PE Entry', 'PE LTP', 'PE TGT', 'PE Exit',
     'Net Invest', 'Net Profit', 'profit%', 'Exit Date', 'remarks'
 ]
 show_df = df[display_cols].copy()
 for dc in ('Entry Date', 'Exit Date'):
     show_df[dc] = pd.to_datetime(show_df[dc], errors='coerce').dt.strftime('%d-%m-%Y')
+numeric_cols = [
+    'CE Entry', 'CE LTP', 'CE TGT',
+    'PE Entry', 'PE LTP', 'PE TGT',
+    'Net Invest', 'Net Profit', 'profit%'
+]
+for nc in numeric_cols:
+    show_df[nc] = pd.to_numeric(show_df[nc], errors='coerce').astype('float64')
 
-open_legs = int(df['_is_open'].sum())
-total_invest = df.drop_duplicates('S.no')['Net Invest'].sum()
-total_profit = df.drop_duplicates('S.no')['Net Profit'].sum()
+open_legs = int(df['_open_legs'].sum())
+total_invest = df['Net Invest'].sum()
+total_profit = df['Net Profit'].sum()
 overall_pct = (total_profit / total_invest * 100) if total_invest else 0.0
 
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Open Legs", open_legs)
 m2.metric("Total Invested", f"₹{total_invest:,.0f}")
 m3.metric("Total Net Profit", f"₹{total_profit:,.0f}")
-m4.metric("Overall %", f"{overall_pct:.1f}%")
+m4.metric("Overall PNL %", f"{overall_pct:.1f}%")
 
 
 def color_pnl(val):
@@ -422,27 +441,28 @@ def color_pnl(val):
 
 
 def color_tgt_hit(row):
-    # Highlight LTP once it has reached that leg's TGT.
+    # Highlight each leg's LTP once it has reached that leg's own TGT.
     styles = [''] * len(row)
     try:
-        ltp_idx = show_df.columns.get_loc('LTP')
-        if row['TGT'] > 0 and row['LTP'] >= row['TGT']:
-            styles[ltp_idx] = 'background-color: darkgreen; color: white; font-weight: 700'
+        for leg_label in ('CE', 'PE'):
+            ltp_idx = show_df.columns.get_loc(f'{leg_label} LTP')
+            if row[f'{leg_label} TGT'] > 0 and row[f'{leg_label} LTP'] >= row[f'{leg_label} TGT']:
+                styles[ltp_idx] = 'background-color: darkgreen; color: white; font-weight: 700'
     except Exception:
         pass
     return styles
 
 
 format_dict = {
-    'entry': '{:.2f}', 'LTP': '{:.2f}', 'TGT': '{:.2f}', 'exit': '{:.2f}', 'points': '{:.2f}',
-    'invest': '{:,.0f}', 'profit': '{:,.0f}', 'Net Invest': '{:,.0f}',
-    'Net Profit': '{:,.0f}', 'profit%': '{:.1f}%'
+    'CE Entry': '{:.2f}', 'CE LTP': '{:.2f}', 'CE TGT': '{:.2f}',
+    'PE Entry': '{:.2f}', 'PE LTP': '{:.2f}', 'PE TGT': '{:.2f}',
+    'Net Invest': '{:,.0f}', 'Net Profit': '{:,.0f}', 'profit%': '{:.1f}%'
 }
 
 styled = (
     show_df.style
     .apply(color_tgt_hit, axis=1)
-    .map(color_pnl, subset=['points', 'profit', 'Net Profit', 'profit%'])
+    .map(color_pnl, subset=['Net Profit', 'profit%'])
     .set_properties(subset=['SYMBOL'], **{'background-color': '#dbeeff'})
     .format(format_dict, na_rep='—')
     .set_properties(**{'text-align': 'center', 'font-size': '15px'})
@@ -463,6 +483,26 @@ sel_sno = options[choice]
 pos = next(p for p in positions if p['sno'] == sel_sno)
 
 with st.form("edit_position_form"):
+    st.caption("Entry / Qty")
+    e1, e2, e3, e4 = st.columns(4)
+    ce_entry_val = e1.number_input(
+        "CE Entry", min_value=0.0, step=0.05, format="%.2f",
+        value=float(pos.get('ce_entry') or 0.0)
+    )
+    ce_qty_val = e2.number_input(
+        "CE Qty", min_value=1, step=1,
+        value=int(pos.get('ce_qty') or 1)
+    )
+    pe_entry_val = e3.number_input(
+        "PE Entry", min_value=0.0, step=0.05, format="%.2f",
+        value=float(pos.get('pe_entry') or 0.0)
+    )
+    pe_qty_val = e4.number_input(
+        "PE Qty", min_value=1, step=1,
+        value=int(pos.get('pe_qty') or 1)
+    )
+
+    st.caption("Exit")
     c1, c2 = st.columns(2)
     ce_exit_val = c1.number_input(
         "CE Exit", min_value=0.0, step=0.05, format="%.2f",
@@ -483,6 +523,10 @@ with st.form("edit_position_form"):
     delete_clicked = delete_col.form_submit_button("🗑️ Delete Position", use_container_width=True)
 
     if save_clicked:
+        pos['ce_entry'] = ce_entry_val
+        pos['pe_entry'] = pe_entry_val
+        pos['ce_qty'] = int(ce_qty_val)
+        pos['pe_qty'] = int(pe_qty_val)
         pos['ce_exit'] = ce_exit_val if ce_exit_val > 0 else None
         pos['pe_exit'] = pe_exit_val if pe_exit_val > 0 else None
         pos['exit_date'] = str(exit_date_val) if (ce_exit_val > 0 or pe_exit_val > 0) else None
