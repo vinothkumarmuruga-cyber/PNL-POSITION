@@ -558,7 +558,7 @@ for pos_idx, p in enumerate(positions_display):
         cells.append(f'<td class="{band}">{lc["invest"]:,.0f}</td>')
         cells.append(f'<td class="{band}" style="{pnl_style(lc["profit"])}">{lc["profit"]:,.0f}</td>')
         if i == 0:
-            cells.append(f'<td rowspan="2" class="{band}" style="{pnl_style(net_profit)}">{net_invest:,.0f}</td>')
+            cells.append(f'<td rowspan="2" class="{band}">{net_invest:,.0f}</td>')
             cells.append(f'<td rowspan="2" class="{band}" style="{pnl_style(net_profit)}">{net_profit:,.0f}</td>')
             cells.append(f'<td rowspan="2" class="{band}" style="{pnl_style(net_profit)}">{net_pct:.1f}%</td>')
             cells.append(f'<td rowspan="2" class="{band}">{exit_date_str}</td>')
@@ -591,10 +591,10 @@ m4.metric("Overall PNL %", f"{overall_pct:.1f}%")
 
 st.markdown("""
     <style>
-        .pnl-table-wrap { overflow-x: auto; border: 1px solid #d0d0d0; border-radius: 6px; }
+        .pnl-table-wrap { overflow-x: auto; border: 2px solid #2b2b2b; border-radius: 6px; }
         table.pnl-table { border-collapse: collapse; width: 100%; font-size: 14px; white-space: nowrap; }
         table.pnl-table th, table.pnl-table td {
-            border: 1px solid #d0d0d0; padding: 6px 10px; text-align: center;
+            border: 1px solid #2b2b2b; padding: 6px 10px; text-align: center;
         }
         table.pnl-table thead th {
             background-color: #f4a261; color: #1a1a1a; font-weight: 700;
