@@ -1,424 +1,454 @@
-"""
-Upstox Live LTP — Option Strategy P&L tracker (Streamlit)
------------------------------------------------------------
-Reads your Option_Strategy_PNL.xlsx layout (Monthly - D / Monthly -ND /
-Weekly - D, 2 rows per position = CE leg + PE leg), lets you fill in each
-leg's expiry, resolves Upstox instrument keys, pulls live LTP via the
-Upstox v3 Market Quote API, and shows live points / live P&L per position.
-
-Run locally:
-    pip install -r requirements.txt
-    streamlit run app.py
-
-Deploy on Streamlit Cloud:
-    Push this folder to a repo, deploy on share.streamlit.io, then in
-    App settings -> Secrets paste:
-        UPSTOX_CLIENT_ID = "..."
-        UPSTOX_CLIENT_SECRET = "..."
-        REDIRECT_URI = "https://<your-app>.streamlit.app"
-    Register that same REDIRECT_URI in your Upstox developer app.
-"""
-
-import gzip
-import io
-import re
-from datetime import date, datetime
-
+import streamlit as st
 import pandas as pd
 import requests
-import streamlit as st
-from openpyxl import load_workbook
+import os
+import re
+import json
+import time
+import gzip
+import shutil
+import concurrent.futures
+from datetime import datetime, timedelta, timezone
 
-from positions_data import POSITIONS  # bundled snapshot; re-export after editing (see sidebar)
-
-try:
-    from streamlit_autorefresh import st_autorefresh
-    HAS_AUTOREFRESH = True
-except ImportError:
-    HAS_AUTOREFRESH = False
-
-st.set_page_config(page_title="Option Strategy P&L — Live LTP", layout="wide")
-
-SHEET_NAMES = ['Monthly - D ', 'Monthly -ND', 'Weekly - D ']  # exact tab names, incl. trailing spaces
-AUTHORIZE_URL = "https://api.upstox.com/v2/login/authorization/dialog"
-TOKEN_URL = "https://api.upstox.com/v2/login/authorization/token"
-LTP_URL = "https://api.upstox.com/v3/market-quote/ltp"
-INSTRUMENT_MASTER_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
-
-# ---------------------------------------------------------------- helpers
-
-def normalize_symbol(s: str) -> str:
-    return re.sub(r"[^A-Z0-9]", "", str(s or "").upper())
+# ============================================================
+# IST helpers (same convention as the OTM Positional Scanner)
+# ============================================================
+IST_OFFSET = timedelta(hours=5, minutes=30)
+IST = timezone(IST_OFFSET)
 
 
-def parse_strike_cell(text):
-    m = re.match(r"^(\d+(?:\.\d+)?)\s*(CE|PE)$", str(text or "").strip(), re.IGNORECASE)
-    if not m:
-        return None
-    return float(m.group(1)), m.group(2).upper()
+def get_ist_now():
+    return datetime.now(IST)
 
 
-def cell_or_none(v):
-    return None if v in ("", None) else v
+st.set_page_config(page_title="Positional PNL Tracker", layout="wide")
+
+st.markdown("""
+    <style>
+        .block-container { padding-top: 1rem !important; padding-bottom: 1rem !important; }
+        h1 { font-size: 1.8rem !important; margin-bottom: 0.3rem !important; }
+        div[data-testid="stDataFrame"] { font-weight: 600 !important; }
+    </style>
+""", unsafe_allow_html=True)
+
+# ============================================================
+# Persistence — same data/ folder + NSE.json the scanner already uses.
+# Run this file from the same folder as the OTM Positional Scanner
+# (e.g. as a second page: pages/2_PNL_Tracker.py) so it can reuse the
+# already-downloaded NSE.json and the saved Upstox token.
+# ============================================================
+DATA_DIR = 'data'
+if not os.path.exists(DATA_DIR):
+    os.makedirs(DATA_DIR)
+
+TOKEN_FILE = os.path.join(DATA_DIR, 'token.json')
+LTP_CACHE_FILE = os.path.join(DATA_DIR, 'ltp_cache.json')
+POSITIONS_FILE = os.path.join(DATA_DIR, 'pnl_positions.json')
+NSE_JSON_PATH = 'NSE.json'
+
+# Editable input columns — this is ALL the user ever types in.
+INPUT_COLUMNS = [
+    'S.no', 'Entry Date', 'STRATEGY', 'SYMBOL', 'STRIKE',
+    'Expiry', 'Qty', 'entry', 'exit', 'Exit Date', 'remarks'
+]
+INPUT_DTYPES = {
+    'S.no': 'Int64', 'Entry Date': 'object', 'STRATEGY': 'object',
+    'SYMBOL': 'object', 'STRIKE': 'object', 'Expiry': 'object',
+    'Qty': 'Int64', 'entry': 'float64', 'exit': 'float64',
+    'Exit Date': 'object', 'remarks': 'object'
+}
 
 
-def positions_to_df(positions: list) -> pd.DataFrame:
-    df = pd.DataFrame(positions)
-    for col in ("entry_date", "exit_date"):
-        df[col] = pd.to_datetime(df[col], errors="coerce")
-    df["expiry_date"] = pd.to_datetime(df["expiry_date"], errors="coerce").dt.date
-    df["instrument_key"] = df["instrument_key"].fillna("")
-    return df
-
-
-# ---------------------------------------------------------------- parse workbook -> positions
-
-def parse_workbook(file) -> pd.DataFrame:
-    """Returns one row per leg: sheet, position_no, leg (1/2), symbol, strike_text,
-    strike, opt_type, lot_size, qty, entry, exit, entry_date, exit_date, remarks."""
-    wb = load_workbook(file, data_only=False)
-    rows = []
-    for sheet_name in SHEET_NAMES:
-        if sheet_name not in wb.sheetnames:
-            continue
-        ws = wb[sheet_name]
-        header_row = None
-        for r in range(1, ws.max_row + 1):
-            if ws.cell(row=r, column=2).value == "S.no":
-                header_row = r
-                break
-        if header_row is None:
-            continue
-
-        r = header_row + 1
-        max_r = ws.max_row
-        while r <= max_r:
-            sno = ws.cell(row=r, column=2).value
-            if isinstance(sno, (int, float)):
-                leg1_row = r
-                leg2_row = r + 1
-                leg2_f = ws.cell(row=leg2_row, column=6).value if leg2_row <= max_r else None
-                leg2_b = ws.cell(row=leg2_row, column=2).value if leg2_row <= max_r else None
-                has_leg2 = bool(leg2_f) and not isinstance(leg2_b, (int, float))
-
-                lot_size = ws.cell(row=leg1_row, column=7).value
-                entry_date = ws.cell(row=leg1_row, column=3).value
-                strategy = ws.cell(row=leg1_row, column=4).value
-                symbol = ws.cell(row=leg1_row, column=5).value
-
-                for leg_num, leg_row in ([(1, leg1_row), (2, leg2_row)] if has_leg2 else [(1, leg1_row)]):
-                    strike_text = ws.cell(row=leg_row, column=6).value
-                    parsed = parse_strike_cell(strike_text)
-                    rows.append({
-                        "sheet": sheet_name.strip(),
-                        "position_no": int(sno),
-                        "row": leg_row,
-                        "leg": leg_num,
-                        "entry_date": entry_date,
-                        "strategy": strategy,
-                        "symbol": symbol,
-                        "strike_text": strike_text,
-                        "strike": parsed[0] if parsed else None,
-                        "opt_type": parsed[1] if parsed else None,
-                        "lot_size": lot_size,
-                        "qty": cell_or_none(ws.cell(row=leg_row, column=8).value),
-                        "entry": cell_or_none(ws.cell(row=leg_row, column=9).value),
-                        "exit": cell_or_none(ws.cell(row=leg_row, column=10).value),
-                        "exit_date": ws.cell(row=leg_row, column=17).value,
-                        "remarks": ws.cell(row=leg_row, column=18).value,
-                        "expiry_date": None,
-                        "instrument_key": "",
-                    })
-                r = (leg2_row if has_leg2 else leg1_row) + 1
-                continue
-            r += 1
-    return pd.DataFrame(rows)
-
-
-# ---------------------------------------------------------------- Upstox: instrument master
-
-@st.cache_data(ttl=6 * 3600, show_spinner="Downloading & filtering Upstox instrument master...")
-def fetch_instrument_master(symbols_key: tuple) -> pd.DataFrame:
-    symbols = set(symbols_key)
-    resp = requests.get(INSTRUMENT_MASTER_URL, timeout=120)
-    resp.raise_for_status()
-    data = gzip.decompress(resp.content)
-    import json
-    all_records = json.loads(data)
-    kept = []
-    for rec in all_records:
-        if rec.get("segment") != "NSE_FO":
-            continue
-        if rec.get("instrument_type") not in ("CE", "PE"):
-            continue
-        norm = normalize_symbol(rec.get("name"))
-        if norm not in symbols:
-            continue
-        kept.append({
-            "name": rec.get("name"),
-            "trading_symbol": rec.get("trading_symbol"),
-            "instrument_key": rec.get("instrument_key"),
-            "strike": rec.get("strike_price"),
-            "type": rec.get("instrument_type"),
-            "expiry_ms": rec.get("expiry"),
-        })
-    return pd.DataFrame(kept)
-
-
-def match_instrument_key(symbol, strike, opt_type, expiry: date, master: pd.DataFrame):
-    if master.empty or not expiry or strike is None or opt_type is None:
-        return None, "no data"
-    norm_symbol = normalize_symbol(symbol)
-    cand = master[(master["strike"] == strike) & (master["type"] == opt_type)]
-    cand = cand[cand["expiry_ms"].apply(
-        lambda ms: bool(ms) and datetime.fromtimestamp(ms / 1000).date() == expiry
-    )]
-    if cand.empty:
-        return None, "NOT FOUND"
-    exact = cand[cand["name"].apply(normalize_symbol) == norm_symbol]
-    pool = exact if not exact.empty else cand[cand["name"].apply(
-        lambda n: normalize_symbol(n) in norm_symbol or norm_symbol in normalize_symbol(n)
-    )]
-    if len(pool) == 1:
-        return pool.iloc[0]["instrument_key"], "matched"
-    if len(pool) == 0:
-        return None, "NOT FOUND"
-    return None, f"AMBIGUOUS ({len(pool)})"
-
-
-# ---------------------------------------------------------------- Upstox: OAuth + LTP
-
-def authorize_url():
-    client_id = st.secrets.get("UPSTOX_CLIENT_ID", "")
-    redirect_uri = st.secrets.get("REDIRECT_URI", "")
-    return (f"{AUTHORIZE_URL}?client_id={client_id}&redirect_uri={redirect_uri}"
-            f"&response_type=code")
-
-
-def exchange_code_for_token(code: str):
-    resp = requests.post(TOKEN_URL, data={
-        "code": code,
-        "client_id": st.secrets.get("UPSTOX_CLIENT_ID", ""),
-        "client_secret": st.secrets.get("UPSTOX_CLIENT_SECRET", ""),
-        "redirect_uri": st.secrets.get("REDIRECT_URI", ""),
-        "grant_type": "authorization_code",
-    }, headers={"accept": "application/json"}, timeout=30)
-    resp.raise_for_status()
-    return resp.json()["access_token"]
-
-
-def fetch_ltp(instrument_keys: list, access_token: str) -> dict:
-    """Returns {instrument_key: last_price}."""
-    out = {}
-    for i in range(0, len(instrument_keys), 500):
-        batch = instrument_keys[i:i + 500]
-        resp = requests.get(LTP_URL, params={"instrument_key": ",".join(batch)},
-                             headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
-                             timeout=30)
-        if resp.status_code == 401:
-            raise RuntimeError("Upstox token expired/invalid — reconnect.")
-        resp.raise_for_status()
-        for rec in resp.json().get("data", {}).values():
-            tok = rec.get("instrument_token")
-            if tok:
-                out[tok] = rec.get("last_price")
-    return out
-
-
-# ---------------------------------------------------------------- app state
-
-if "df" not in st.session_state:
-    st.session_state.df = positions_to_df(POSITIONS)  # loads bundled positions_data.py on first run
-if "access_token" not in st.session_state:
-    st.session_state.access_token = None
-
-# handle OAuth redirect
-qp = st.query_params
-if "code" in qp and not st.session_state.access_token:
-    try:
-        st.session_state.access_token = exchange_code_for_token(qp["code"])
-        st.query_params.clear()
-        st.success("Connected to Upstox.")
-    except Exception as e:
-        st.error(f"Token exchange failed: {e}")
-
-# ---------------------------------------------------------------- sidebar
-
-st.sidebar.header("Upstox connection")
-if st.session_state.access_token:
-    st.sidebar.success("Connected. Reconnect daily (token expires 3:30 AM IST).")
-else:
-    st.sidebar.warning("Not connected.")
-    st.sidebar.link_button("Login to Upstox", authorize_url())
-
-st.sidebar.divider()
-st.sidebar.caption(f"Loaded from bundled positions_data.py ({len(POSITIONS)} legs) unless you upload a newer workbook below.")
-uploaded = st.sidebar.file_uploader("Upload a newer Option_Strategy_PNL.xlsx", type=["xlsx"])
-if uploaded is not None and st.sidebar.button("Load uploaded workbook"):
-    st.session_state.df = parse_workbook(uploaded)
-    st.sidebar.success(f"Loaded {len(st.session_state.df)} legs.")
-if st.sidebar.button("Reset to bundled positions_data.py"):
-    st.session_state.df = positions_to_df(POSITIONS)
-    st.rerun()
-
-if HAS_AUTOREFRESH:
-    refresh_on = st.sidebar.checkbox("Auto-refresh LTP every 30s", value=False)
-    if refresh_on:
-        st_autorefresh(interval=30_000, key="ltp_autorefresh")
-
-# ---------------------------------------------------------------- main
-
-st.title("Option Strategy P&L — Live LTP")
-
-df = st.session_state.df
-
-st.subheader("1. Fill Expiry Date for open legs, sync & match instrument keys")
-edit_cols = ["sheet", "position_no", "leg", "symbol", "strike_text", "entry", "exit", "expiry_date", "instrument_key"]
-edited = st.data_editor(
-    df[edit_cols],
-    column_config={
-        "expiry_date": st.column_config.DateColumn("Expiry Date"),
-        "instrument_key": st.column_config.TextColumn("Instrument Key (auto or paste manually)"),
-    },
-    disabled=["sheet", "position_no", "leg", "symbol", "strike_text", "entry", "exit"],
-    width="stretch", hide_index=True, key="editor",
-)
-df["expiry_date"] = edited["expiry_date"]
-df["instrument_key"] = edited["instrument_key"]
-
-col_a, col_b, col_c = st.columns(3)
-
-if col_a.button("Sync Instrument Master"):
-    symbols = tuple(sorted(set(normalize_symbol(s) for s in df["symbol"].dropna())))
-    st.session_state.master = fetch_instrument_master(symbols)
-    st.success(f"Cached {len(st.session_state.master)} contracts.")
-
-if col_b.button("Match Instrument Keys"):
-    master = st.session_state.get("master")
-    if master is None or master.empty:
-        st.error("Sync instrument master first.")
-    else:
-        matched = notfound = ambiguous = 0
-        for idx, row in df.iterrows():
-            if row["exit"] not in (None, "") or row["instrument_key"]:
-                continue
-            key, status = match_instrument_key(row["symbol"], row["strike"], row["opt_type"], row["expiry_date"], master)
-            if key:
-                df.at[idx, "instrument_key"] = key
-                matched += 1
-            elif status == "NOT FOUND":
-                df.at[idx, "instrument_key"] = "NOT FOUND"
-                notfound += 1
-            else:
-                df.at[idx, "instrument_key"] = status
-                ambiguous += 1
-        st.session_state.df = df
-        st.success(f"Matched {matched} | Not found {notfound} | Ambiguous {ambiguous}")
-
-open_keyed = df[(df["exit"].isin([None, ""])) & (~df["instrument_key"].isin(["", "NOT FOUND"]))
-                 & (~df["instrument_key"].astype(str).str.startswith("AMBIGUOUS"))]
-
-if col_c.button("Refresh Live LTP", type="primary"):
-    if not st.session_state.access_token:
-        st.error("Connect to Upstox first.")
-    elif open_keyed.empty:
-        st.warning("No open, keyed legs to refresh.")
-    else:
+# ============================================================
+# Token (shared with the scanner — reuse if already saved today)
+# ============================================================
+def load_token():
+    if os.path.exists(TOKEN_FILE):
         try:
-            ltp_map = fetch_ltp(list(open_keyed["instrument_key"].unique()), st.session_state.access_token)
-            now = datetime.now()
-            for idx in open_keyed.index:
-                price = ltp_map.get(df.at[idx, "instrument_key"])
-                if price is not None:
-                    df.at[idx, "ltp"] = price
-                    df.at[idx, "last_updated"] = now
-            st.session_state.df = df
-            st.success(f"Refreshed {len(ltp_map)} instruments.")
-        except Exception as e:
-            st.error(str(e))
-
-# ---------------------------------------------------------------- compute P&L
-
-if "ltp" not in df.columns:
-    df["ltp"] = None
-if "last_updated" not in df.columns:
-    df["last_updated"] = None
+            with open(TOKEN_FILE, 'r') as f:
+                data = json.load(f)
+                if data.get('date') == get_ist_now().strftime('%Y-%m-%d'):
+                    return data.get('token', '')
+        except Exception:
+            pass
+    return ''
 
 
-def leg_pnl(row):
-    entry, exitp, qty, lot = row["entry"], row["exit"], row["qty"], row["lot_size"]
-    if None in (entry, qty, lot):
+def save_token(token):
+    try:
+        with open(TOKEN_FILE, 'w') as f:
+            json.dump({'date': get_ist_now().strftime('%Y-%m-%d'), 'token': token}, f)
+    except Exception:
+        pass
+
+
+# ============================================================
+# LTP cache (shared file with the scanner — same instrument_token keys)
+# ============================================================
+def load_ltp_cache():
+    if os.path.exists(LTP_CACHE_FILE):
+        try:
+            with open(LTP_CACHE_FILE, 'r') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_ltp_cache(new_data):
+    try:
+        cache = load_ltp_cache()
+        cache.update(new_data)
+        with open(LTP_CACHE_FILE, 'w') as f:
+            json.dump(cache, f)
+    except Exception:
+        pass
+
+
+def fetch_ltp(instrument_keys, token):
+    """Batch LTP fetch via Upstox v3 — identical logic to the scanner."""
+    if not token or not instrument_keys:
+        return {}
+    url = "https://api.upstox.com/v3/market-quote/ltp"
+    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
+    batch_size = 50
+    ltp_map = {}
+    batches = [instrument_keys[i:i + batch_size] for i in range(0, len(instrument_keys), batch_size)]
+
+    def fetch_batch(batch):
+        params = {'instrument_key': ','.join(batch)}
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == 'success':
+                    result = {}
+                    for _, details in data.get('data', {}).items():
+                        inst_token = details.get('instrument_token')
+                        last_price = details.get('last_price')
+                        if inst_token is not None:
+                            result[inst_token] = last_price
+                    return result
+        except Exception:
+            pass
+        return {}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(fetch_batch, b) for b in batches]
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                res = future.result()
+                if res:
+                    ltp_map.update(res)
+            except Exception:
+                pass
+    return ltp_map
+
+
+# ============================================================
+# NSE instrument master — same file/shape the scanner downloads.
+# Used ONLY to auto-resolve instrument_key + lot_size for a leg.
+# ============================================================
+@st.cache_data
+def load_nse_json():
+    if not os.path.exists(NSE_JSON_PATH):
+        return pd.DataFrame()
+    try:
+        df = pd.read_json(NSE_JSON_PATH)
+        if 'segment' in df.columns:
+            df = df[df['segment'] == 'NSE_FO']
+        df['expiry_dt'] = pd.to_datetime(df['expiry'], unit='ms').dt.normalize()
+        df['strike_price'] = df['strike_price'].astype(float).round(2)
+        return df
+    except Exception as e:
+        st.error(f"Error loading NSE.json: {e}")
+        return pd.DataFrame()
+
+
+STRIKE_RE = re.compile(r'(\d+(?:\.\d+)?)\s*(CE|PE)', re.IGNORECASE)
+
+
+def parse_strike(strike_text):
+    """'420 CE' / '420CE' -> (420.0, 'CE'). Returns (None, None) if unparsable."""
+    if not strike_text or not isinstance(strike_text, str):
         return None, None
-    if exitp not in (None, ""):
-        points = exitp - entry
-        return points * qty, lot * points * qty
-    if row["ltp"] is not None:
-        points = row["ltp"] - entry
-        return points * qty, lot * points * qty
-    return None, None
+    m = STRIKE_RE.search(strike_text.strip())
+    if not m:
+        return None, None
+    return round(float(m.group(1)), 2), m.group(2).upper()
 
 
-df[["points", "profit"]] = df.apply(lambda r: pd.Series(leg_pnl(r)), axis=1)
+@st.cache_data(show_spinner=False)
+def resolve_instrument(symbol, strike, option_type, expiry_str, _nse_json_mtime):
+    """
+    Looks up (instrument_key, lot_size) for one leg from NSE.json.
+    _nse_json_mtime is only there to bust the cache when NSE.json is
+    re-downloaded — it isn't used in the lookup itself.
+    """
+    df = load_nse_json()
+    if df.empty or symbol is None or strike is None or option_type is None or not expiry_str:
+        return None, None
+    try:
+        expiry_dt = pd.to_datetime(expiry_str).normalize()
+    except Exception:
+        return None, None
+    match = df[
+        (df['underlying_symbol'].astype(str).str.upper() == str(symbol).upper()) &
+        (df['strike_price'] == round(float(strike), 2)) &
+        (df['instrument_type'].astype(str).str.upper() == option_type.upper()) &
+        (df['expiry_dt'] == expiry_dt)
+    ]
+    if match.empty:
+        return None, None
+    row = match.iloc[0]
+    inst_key = row.get('instrument_key')
+    lot_size = row.get('lot_size')
+    lot_size = int(lot_size) if pd.notna(lot_size) else None
+    return inst_key, lot_size
 
-st.subheader("2. Positions")
-for sheet_name in df["sheet"].unique():
-    sdf = df[df["sheet"] == sheet_name]
-    st.markdown(f"**{sheet_name}**")
-    agg = sdf.groupby("position_no").agg(
-        symbol=("symbol", "first"), strategy=("strategy", "first"),
-        entry_date=("entry_date", "first"),
-        net_invest=("entry", lambda s: None),  # placeholder, recomputed below
-    ).reset_index()
 
-    # recompute net invest/profit per position properly
-    rows_out = []
-    for pos_no, g in sdf.groupby("position_no"):
-        invest = sum((r["entry"] or 0) * (r["qty"] or 0) * (r["lot_size"] or 0) for _, r in g.iterrows())
-        profit_sum = g["profit"].dropna().sum() if g["profit"].notna().any() else None
-        pct = (profit_sum / invest * 100) if invest and profit_sum is not None else None
-        rows_out.append({
-            "Position": pos_no,
-            "Symbol": g["symbol"].iloc[0],
-            "Strategy": g["strategy"].iloc[0],
-            "Legs": ", ".join(f"{r['strike_text']} @ {r['ltp'] if pd.notna(r['ltp']) else '-'}" for _, r in g.iterrows()),
-            "Net Invest": round(invest, 2),
-            "Live/Realized Net P&L": round(profit_sum, 2) if profit_sum is not None else None,
-            "P&L %": round(pct, 2) if pct is not None else None,
-            "Status": "closed" if g["exit"].notna().all() and (g["exit"] != "").all() else "open",
-        })
-    out_df = pd.DataFrame(rows_out)
+# ============================================================
+# Position storage
+# ============================================================
+def load_positions():
+    if os.path.exists(POSITIONS_FILE):
+        try:
+            with open(POSITIONS_FILE, 'r') as f:
+                data = json.load(f)
+            df = pd.DataFrame(data)
+            for c in INPUT_COLUMNS:
+                if c not in df.columns:
+                    df[c] = None
+            return df[INPUT_COLUMNS]
+        except Exception:
+            pass
+    return pd.DataFrame(columns=INPUT_COLUMNS)
 
-    def style_pnl(v):
-        if v is None or pd.isna(v):
-            return ""
-        return "color: #1a7f37" if v >= 0 else "color: #cf222e"
 
-    styler = out_df.style
-    styler = styler.map(style_pnl, subset=["Live/Realized Net P&L", "P&L %"]) if hasattr(styler, "map") \
-        else styler.applymap(style_pnl, subset=["Live/Realized Net P&L", "P&L %"])
-    st.dataframe(styler, width="stretch", hide_index=True)
+def save_positions(df):
+    try:
+        clean = df.copy()
+        # Blank strings -> None so JSON/date widgets round-trip cleanly
+        clean = clean.where(pd.notna(clean), None)
+        with open(POSITIONS_FILE, 'w') as f:
+            json.dump(clean.to_dict(orient='records'), f, default=str)
+    except Exception as e:
+        st.error(f"Could not save positions: {e}")
 
-    total_invest = out_df["Net Invest"].sum()
-    total_pnl = out_df["Live/Realized Net P&L"].dropna().sum()
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Net Invest", f"{total_invest:,.0f}")
-    c2.metric("Net P&L", f"{total_pnl:,.0f}")
-    c3.metric("P&L %", f"{(total_pnl/total_invest*100):.2f}%" if total_invest else "-")
-    st.divider()
 
-st.subheader("3. Export snapshot")
-csv = df.to_csv(index=False).encode()
-st.download_button("Download current data as CSV", csv, "option_pnl_snapshot.csv", "text/csv")
+# ============================================================
+# Sidebar — token, NSE.json refresh, auto-refresh
+# ============================================================
+with st.sidebar:
+    st.header("Configuration")
+    saved_token = load_token()
+    access_token = st.text_input("Upstox Access Token", value=saved_token, type="password")
+    if access_token and access_token != saved_token:
+        save_token(access_token)
 
-# regenerate positions_data.py so today's Expiry/Instrument Key fills survive a redeploy —
-# download this and commit it over the existing positions_data.py in your repo.
-export_cols = ["sheet", "position_no", "leg", "entry_date", "strategy", "symbol", "strike_text",
-               "strike", "opt_type", "lot_size", "qty", "entry", "exit", "exit_date", "remarks",
-               "expiry_date", "instrument_key"]
-export_records = df[export_cols].copy()
-for c in ("entry_date", "exit_date"):
-    export_records[c] = export_records[c].apply(lambda v: v.isoformat() if pd.notna(v) else None)
-export_records["expiry_date"] = export_records["expiry_date"].apply(lambda v: v.isoformat() if pd.notna(v) else None)
-py_source = ('"""Bundled snapshot of Option_Strategy_PNL.xlsx, parsed into per-leg rows."""\n\nPOSITIONS = '
-             + export_records.to_dict(orient="records").__repr__())
-st.download_button("Download updated positions_data.py", py_source.encode(), "positions_data.py", "text/x-python")
+    st.caption(
+        "Only **LTP** and **lot Size** are filled in automatically "
+        "(LTP live from Upstox, lot Size from NSE.json). Everything "
+        "else — dates, strategy, symbol, strike, qty, entry, exit, "
+        "remarks — you type in the table."
+    )
+
+    st.markdown("---")
+    st.subheader("NSE Instrument JSON")
+    st.caption(f"{'✅ Found' if os.path.exists(NSE_JSON_PATH) else '❌ Missing'}: {NSE_JSON_PATH}")
+    if st.button("🔄 Download Latest NSE.json", use_container_width=True):
+        try:
+            with st.spinner("Downloading NSE.json from Upstox..."):
+                url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+                headers = {"User-Agent": "Mozilla/5.0"}
+                response = requests.get(url, headers=headers, stream=True)
+                if response.status_code == 200:
+                    with open(NSE_JSON_PATH, "wb") as f_out:
+                        with gzip.GzipFile(fileobj=response.raw) as f_in:
+                            shutil.copyfileobj(f_in, f_out)
+                    st.cache_data.clear()
+                    st.success("Updated.")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error(f"Download failed: HTTP {response.status_code}")
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+    st.markdown("---")
+    st.header("Auto Refresh")
+    auto_refresh = st.checkbox("Enable Auto-Refresh", value=False)
+    refresh_interval = st.slider("Refresh Interval (seconds)", min_value=5, max_value=60, value=15)
+
+
+# ============================================================
+# Main page
+# ============================================================
+st.title("Positional PNL Tracker")
+st.caption(
+    "Give the same **S.no** to every leg of one strategy (e.g. both the "
+    "CE and PE row of a spread) — Net Invest / Net Profit / profit% are "
+    "totalled across all legs that share an S.no."
+)
+
+if 'positions_df' not in st.session_state:
+    st.session_state.positions_df = load_positions()
+
+nse_json_mtime = os.path.getmtime(NSE_JSON_PATH) if os.path.exists(NSE_JSON_PATH) else 0
+
+# DateColumn requires an actual datetime dtype, not plain strings — the
+# JSON store keeps dates as ISO strings, so convert on the way into the editor.
+editor_input = st.session_state.positions_df.copy()
+for _dc in ('Entry Date', 'Expiry', 'Exit Date'):
+    editor_input[_dc] = pd.to_datetime(editor_input[_dc], errors='coerce')
+
+edited_df = st.data_editor(
+    editor_input,
+    num_rows="dynamic",
+    width='stretch',
+    hide_index=True,
+    key="positions_editor",
+    column_config={
+        'S.no': st.column_config.NumberColumn('S.no', help="Same number for every leg of one strategy", step=1),
+        'Entry Date': st.column_config.DateColumn('Entry Date', format="DD-MM-YYYY"),
+        'STRATEGY': st.column_config.TextColumn('STRATEGY', help="e.g. 2.1 BULL"),
+        'SYMBOL': st.column_config.TextColumn('SYMBOL', help="e.g. KOTAKBANK"),
+        'STRIKE': st.column_config.TextColumn('STRIKE', help="e.g. 420 CE"),
+        'Expiry': st.column_config.DateColumn('Expiry', format="DD-MM-YYYY", help="Option expiry — needed to fetch LTP/lot size"),
+        'Qty': st.column_config.NumberColumn('Qty', step=1),
+        'entry': st.column_config.NumberColumn('entry', format="%.2f"),
+        'exit': st.column_config.NumberColumn('exit', format="%.2f", help="Leave blank while the position is open"),
+        'Exit Date': st.column_config.DateColumn('Exit Date', format="DD-MM-YYYY"),
+        'remarks': st.column_config.TextColumn('remarks'),
+    }
+)
+
+# Normalize the edited datetime columns back to plain 'YYYY-MM-DD' strings
+# for storage/comparison/downstream lookups.
+for _dc in ('Entry Date', 'Expiry', 'Exit Date'):
+    edited_df[_dc] = pd.to_datetime(edited_df[_dc], errors='coerce').dt.strftime('%Y-%m-%d')
+    edited_df[_dc] = edited_df[_dc].where(edited_df[_dc].notna(), None)
+
+if not edited_df.equals(st.session_state.positions_df):
+    st.session_state.positions_df = edited_df
+    save_positions(edited_df)
+
+if edited_df.dropna(how='all').empty:
+    st.info("Add a row above for each leg of a position (S.no, dates, strategy, symbol, strike e.g. '420 CE', expiry, qty, entry). LTP and lot Size fill in automatically once a token and NSE.json are available.")
+    st.stop()
+
+# ============================================================
+# Compute: resolve instrument -> lot size + LTP -> points/invest/profit
+# ============================================================
+work = edited_df.dropna(subset=['SYMBOL', 'STRIKE']).copy()
+
+strike_parsed = work['STRIKE'].apply(parse_strike)
+work['_strike_price'] = strike_parsed.apply(lambda t: t[0])
+work['_option_type'] = strike_parsed.apply(lambda t: t[1])
+
+resolved = work.apply(
+    lambda r: resolve_instrument(r['SYMBOL'], r['_strike_price'], r['_option_type'], r['Expiry'], nse_json_mtime),
+    axis=1
+)
+work['instrument_key'] = resolved.apply(lambda t: t[0])
+work['lot Size'] = resolved.apply(lambda t: t[1])
+
+unresolved = work[work['instrument_key'].isna() & work['SYMBOL'].notna() & work['_strike_price'].notna()]
+if not unresolved.empty:
+    st.warning(
+        f"{len(unresolved)} row(s) couldn't be matched in NSE.json (check SYMBOL / STRIKE like '420 CE' / Expiry). "
+        "LTP and lot Size will show 0 for those rows until they resolve."
+    )
+
+# --- Live LTP ---
+all_keys = work['instrument_key'].dropna().unique().tolist()
+if access_token and all_keys:
+    ist_now = get_ist_now()
+    is_market_hours = datetime.strptime("09:00", "%H:%M").time() <= ist_now.time() <= datetime.strptime("15:40", "%H:%M").time()
+    ltp_cache = load_ltp_cache()
+    missing_keys = [k for k in all_keys if k not in ltp_cache]
+    keys_to_fetch = all_keys if is_market_hours else missing_keys
+    if keys_to_fetch:
+        fetched = fetch_ltp(keys_to_fetch, access_token)
+        if fetched:
+            save_ltp_cache(fetched)
+            ltp_cache = load_ltp_cache()
+    work['LTP'] = work['instrument_key'].map(lambda k: ltp_cache.get(k, 0.0) if pd.notna(k) else 0.0)
+else:
+    work['LTP'] = 0.0
+    if not access_token:
+        st.warning("Enter your Upstox Access Token in the sidebar to fetch live LTP.")
+
+work['lot Size'] = work['lot Size'].fillna(0).astype(int)
+work['entry'] = pd.to_numeric(work['entry'], errors='coerce').fillna(0.0)
+work['exit'] = pd.to_numeric(work['exit'], errors='coerce')
+work['Qty'] = pd.to_numeric(work['Qty'], errors='coerce').fillna(0).astype(int)
+
+# Open position -> mark-to-market against live LTP. Closed -> use actual exit.
+work['_is_open'] = work['exit'].isna()
+work['_effective_exit'] = work['exit'].where(~work['_is_open'], work['LTP'])
+
+# points = (exit - entry) * Qty   |   invest = entry * lotSize * Qty   |   profit = points * lotSize
+work['points'] = (work['_effective_exit'] - work['entry']) * work['Qty']
+work['invest'] = work['entry'] * work['lot Size'] * work['Qty']
+work['profit'] = work['points'] * work['lot Size']
+
+# Position-level totals, grouped by S.no, broadcast back onto every leg
+totals = work.groupby('S.no')[['invest', 'profit']].transform('sum')
+work['Net Invest'] = totals['invest']
+work['Net Profit'] = totals['profit']
+work['profit%'] = (work['Net Profit'] / work['Net Invest'].replace(0, pd.NA) * 100).fillna(0.0)
+
+# ============================================================
+# Display — same column order as the reference sheet, LTP after entry
+# ============================================================
+display_cols = [
+    'S.no', 'Entry Date', 'STRATEGY', 'SYMBOL', 'STRIKE', 'lot Size', 'Qty',
+    'entry', 'LTP', 'exit', 'points', 'invest', 'profit',
+    'Net Invest', 'Net Profit', 'profit%', 'Exit Date', 'remarks'
+]
+show_df = work[display_cols].copy()
+
+open_pos = int(work['_is_open'].sum())
+total_invest = work.drop_duplicates('S.no')['Net Invest'].sum()
+total_profit = work.drop_duplicates('S.no')['Net Profit'].sum()
+overall_pct = (total_profit / total_invest * 100) if total_invest else 0.0
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Open Legs", open_pos)
+m2.metric("Total Invested", f"₹{total_invest:,.0f}")
+m3.metric("Total Net Profit", f"₹{total_profit:,.0f}")
+m4.metric("Overall %", f"{overall_pct:.1f}%")
+
+
+def color_pnl(val):
+    if not isinstance(val, (int, float)):
+        return ''
+    if val > 0:
+        return 'background-color: #d4edda; color: #155724; font-weight: 700'
+    if val < 0:
+        return 'background-color: #f8d7da; color: #721c24; font-weight: 700'
+    return ''
+
+
+format_dict = {
+    'entry': '{:.2f}', 'LTP': '{:.2f}', 'exit': '{:.2f}', 'points': '{:.2f}',
+    'invest': '{:,.0f}', 'profit': '{:,.0f}', 'Net Invest': '{:,.0f}',
+    'Net Profit': '{:,.0f}', 'profit%': '{:.1f}%'
+}
+
+styled = (
+    show_df.style
+    .map(color_pnl, subset=['points', 'profit', 'Net Profit', 'profit%'])
+    .set_properties(subset=['STRATEGY'], **{'background-color': '#c6efce'})
+    .set_properties(subset=['SYMBOL'], **{'background-color': '#dbeeff'})
+    .format(format_dict, na_rep='—')
+    .set_properties(**{'text-align': 'center', 'font-size': '15px'})
+)
+
+st.caption(f"Last Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
+st.dataframe(styled, hide_index=True, width='stretch', height=min(600, 60 + 40 * len(show_df)))
+
+if auto_refresh:
+    time.sleep(refresh_interval)
+    st.rerun()
