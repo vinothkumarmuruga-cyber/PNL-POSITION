@@ -287,12 +287,31 @@ with st.sidebar:
     tg_cfg = load_telegram_config()
     tg_bot_token = st.text_input("Bot Token", value=tg_cfg.get('bot_token', ''), type="password")
     tg_chat_id = st.text_input("Chat ID", value=tg_cfg.get('chat_id', ''))
+    thr_col1, thr_col2 = st.columns(2)
+    profit_threshold = thr_col1.number_input(
+        "Profit % Alert ≥", value=float(tg_cfg.get('profit_threshold', 50.0)),
+        step=5.0, format="%.1f"
+    )
+    loss_threshold = thr_col2.number_input(
+        "Loss % Alert ≤", value=float(tg_cfg.get('loss_threshold', -30.0)),
+        step=5.0, format="%.1f"
+    )
     tg_enabled = st.checkbox(
-        "Enable Alerts (TGT hit, profit% ≥ 50%, profit% ≤ -30%)",
+        f"Enable Alerts (TGT hit, profit% ≥ {profit_threshold:.0f}%, profit% ≤ {loss_threshold:.0f}%)",
         value=tg_cfg.get('enabled', False)
     )
-    if (tg_bot_token, tg_chat_id, tg_enabled) != (tg_cfg.get('bot_token', ''), tg_cfg.get('chat_id', ''), tg_cfg.get('enabled', False)):
-        save_telegram_config({'bot_token': tg_bot_token, 'chat_id': tg_chat_id, 'enabled': tg_enabled})
+    tg_cfg_now = {
+        'bot_token': tg_bot_token, 'chat_id': tg_chat_id, 'enabled': tg_enabled,
+        'profit_threshold': profit_threshold, 'loss_threshold': loss_threshold,
+    }
+    tg_cfg_prev = {
+        'bot_token': tg_cfg.get('bot_token', ''), 'chat_id': tg_cfg.get('chat_id', ''),
+        'enabled': tg_cfg.get('enabled', False),
+        'profit_threshold': tg_cfg.get('profit_threshold', 50.0),
+        'loss_threshold': tg_cfg.get('loss_threshold', -30.0),
+    }
+    if tg_cfg_now != tg_cfg_prev:
+        save_telegram_config(tg_cfg_now)
     if st.button("Send Test Message", use_container_width=True):
         ok, msg = send_telegram_message(tg_bot_token, tg_chat_id, "✅ Hedge PNL Tracker: test alert.")
         st.success("Sent.") if ok else st.error(f"Failed: {msg}")
@@ -486,20 +505,20 @@ for pos_idx, p in enumerate(positions_display):
                 p[f'{leg}_tgt_alerted'] = True
                 alerts_changed = True
         if pos_open_legs > 0:
-            if net_pct >= 50 and not p.get('profit50_alerted'):
+            if net_pct >= profit_threshold and not p.get('profit50_alerted'):
                 ok, msg = send_telegram_message(
                     tg_bot_token, tg_chat_id,
-                    f"🚀 PROFIT ≥ 50% — {p['symbol']} (S.no {p['sno']})\n"
+                    f"🚀 PROFIT ≥ {profit_threshold:.0f}% — {p['symbol']} (S.no {p['sno']})\n"
                     f"Net Profit ₹{net_profit:,.0f} | PNL {net_pct:.1f}%"
                 )
                 if not ok:
                     alert_failures.append(msg)
                 p['profit50_alerted'] = True
                 alerts_changed = True
-            if net_pct <= -30 and not p.get('loss30_alerted'):
+            if net_pct <= loss_threshold and not p.get('loss30_alerted'):
                 ok, msg = send_telegram_message(
                     tg_bot_token, tg_chat_id,
-                    f"⚠️ EXIT? PNL ≤ -30% — {p['symbol']} (S.no {p['sno']})\n"
+                    f"⚠️ EXIT? PNL ≤ {loss_threshold:.0f}% — {p['symbol']} (S.no {p['sno']})\n"
                     f"Net Profit ₹{net_profit:,.0f} | PNL {net_pct:.1f}%"
                 )
                 if not ok:
