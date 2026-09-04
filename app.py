@@ -46,17 +46,13 @@ LTP_CACHE_FILE = os.path.join(DATA_DIR, 'ltp_cache.json')
 POSITIONS_FILE = os.path.join(DATA_DIR, 'pnl_positions.json')
 NSE_JSON_PATH = 'NSE.json'
 
-# Editable input columns — this is ALL the user ever types in.
+# Editable input columns — this is ALL the user ever types in. No Expiry
+# column: the contract is always resolved against the CURRENT (nearest
+# live, expiry >= today) expiry for that symbol/strike/type automatically.
 INPUT_COLUMNS = [
     'S.no', 'Entry Date', 'STRATEGY', 'SYMBOL', 'STRIKE',
-    'Expiry', 'Qty', 'entry', 'exit', 'Exit Date', 'remarks'
+    'Qty', 'entry', 'exit', 'Exit Date', 'remarks'
 ]
-INPUT_DTYPES = {
-    'S.no': 'Int64', 'Entry Date': 'object', 'STRATEGY': 'object',
-    'SYMBOL': 'object', 'STRIKE': 'object', 'Expiry': 'object',
-    'Qty': 'Int64', 'entry': 'float64', 'exit': 'float64',
-    'Exit Date': 'object', 'remarks': 'object'
-}
 
 
 # ============================================================
@@ -178,39 +174,73 @@ def parse_strike(strike_text):
     return round(float(m.group(1)), 2), m.group(2).upper()
 
 
-@st.cache_data(show_spinner=False)
-def resolve_instrument(symbol, strike, option_type, expiry_str, _nse_json_mtime):
+@st.cache_data(show_spinner=False, ttl=300)
+def resolve_instrument(symbol, strike, option_type, today_str, _nse_json_mtime):
     """
-    Looks up (instrument_key, lot_size) for one leg from NSE.json.
-    _nse_json_mtime is only there to bust the cache when NSE.json is
-    re-downloaded — it isn't used in the lookup itself.
+    Auto-resolves the CURRENT contract for this symbol/strike/option-type
+    from NSE.json — no Expiry input. "Current" = the nearest expiry that
+    hasn't lapsed yet (min expiry_dt >= today) among that symbol's listed
+    contracts at this strike/type. today_str is passed in (rather than
+    read live inside) purely so the cache key rolls over at midnight
+    IST — same lookup otherwise re-runs stale after an overnight rollover.
+    _nse_json_mtime busts the cache when NSE.json is re-downloaded.
+    Returns (instrument_key, lot_size, expiry_dt) or (None, None, None).
     """
     df = load_nse_json()
-    if df.empty or symbol is None or strike is None or option_type is None or not expiry_str:
-        return None, None
-    try:
-        expiry_dt = pd.to_datetime(expiry_str).normalize()
-    except Exception:
-        return None, None
+    if df.empty or symbol is None or strike is None or option_type is None:
+        return None, None, None
+    today = pd.to_datetime(today_str).normalize()
     match = df[
         (df['underlying_symbol'].astype(str).str.upper() == str(symbol).upper()) &
         (df['strike_price'] == round(float(strike), 2)) &
         (df['instrument_type'].astype(str).str.upper() == option_type.upper()) &
-        (df['expiry_dt'] == expiry_dt)
+        (df['expiry_dt'] >= today)
     ]
     if match.empty:
-        return None, None
-    row = match.iloc[0]
+        return None, None, None
+    row = match.sort_values('expiry_dt').iloc[0]
     inst_key = row.get('instrument_key')
     lot_size = row.get('lot_size')
     lot_size = int(lot_size) if pd.notna(lot_size) else None
-    return inst_key, lot_size
+    return inst_key, lot_size, row.get('expiry_dt')
 
 
 # ============================================================
 # Position storage
 # ============================================================
+DATE_COLS = ('Entry Date', 'Exit Date')
+NUMERIC_COLS = ('S.no', 'Qty', 'entry', 'exit')
+
+
+def _typed(df):
+    """
+    Forces real datetime/float64 dtype onto the date and numeric columns.
+    This matters even for a brand-new, all-empty DataFrame: a column that's
+    all-None defaults to pandas' generic 'object' dtype, and data_editor's
+    DateColumn/NumberColumn need a matching real dtype to edit correctly —
+    DateColumn just errors on a mismatch (loud), but NumberColumn on an
+    object-dtype column silently coerces whatever you type to 0 instead of
+    raising (that's what was turning a typed '1' into a stored '0'). Always
+    normalizing dtype here, on both the loaded-from-disk and brand-new
+    paths, is what avoids both failure modes.
+    """
+    for dc in DATE_COLS:
+        df[dc] = pd.to_datetime(df[dc], errors='coerce')
+    for nc in NUMERIC_COLS:
+        df[nc] = pd.to_numeric(df[nc], errors='coerce').astype('float64')
+    return df
+
+
 def load_positions():
+    """
+    Loads positions from disk with columns already typed correctly (see
+    _typed). This is the ONLY place that reads from the JSON file — after
+    this, the in-memory st.session_state.positions_df is the single source
+    of truth for the rest of the session; we never rebuild it from disk
+    mid-session, since handing st.data_editor a freshly reconstructed /
+    re-typed DataFrame on every rerun (instead of feeding back exactly
+    what it last returned) is what was scrambling rows between legs.
+    """
     if os.path.exists(POSITIONS_FILE):
         try:
             with open(POSITIONS_FILE, 'r') as f:
@@ -219,16 +249,20 @@ def load_positions():
             for c in INPUT_COLUMNS:
                 if c not in df.columns:
                     df[c] = None
-            return df[INPUT_COLUMNS]
+            return _typed(df[INPUT_COLUMNS].copy())
         except Exception:
             pass
-    return pd.DataFrame(columns=INPUT_COLUMNS)
+    return _typed(pd.DataFrame(columns=INPUT_COLUMNS))
 
 
 def save_positions(df):
+    """Writes a JSON-safe copy to disk. Never mutates df itself — the
+    caller's (datetime-typed) DataFrame keeps being fed straight back
+    into st.data_editor unchanged."""
     try:
         clean = df.copy()
-        # Blank strings -> None so JSON/date widgets round-trip cleanly
+        for dc in DATE_COLS:
+            clean[dc] = pd.to_datetime(clean[dc], errors='coerce').dt.strftime('%Y-%m-%d')
         clean = clean.where(pd.notna(clean), None)
         with open(POSITIONS_FILE, 'w') as f:
             json.dump(clean.to_dict(orient='records'), f, default=str)
@@ -247,10 +281,12 @@ with st.sidebar:
         save_token(access_token)
 
     st.caption(
-        "Only **LTP** and **lot Size** are filled in automatically "
-        "(LTP live from Upstox, lot Size from NSE.json). Everything "
-        "else — dates, strategy, symbol, strike, qty, entry, exit, "
-        "remarks — you type in the table."
+        "Only **Expiry**, **lot Size** and **LTP** are filled in "
+        "automatically — Expiry always auto-picks the CURRENT (nearest "
+        "unexpired) contract for that symbol/strike from NSE.json, lot "
+        "Size comes from the same lookup, and LTP is live from Upstox. "
+        "Everything else — dates, strategy, symbol, strike, qty, entry, "
+        "exit, remarks — you type in the table."
     )
 
     st.markdown("---")
@@ -294,27 +330,31 @@ st.caption(
 if 'positions_df' not in st.session_state:
     st.session_state.positions_df = load_positions()
 
+# Never render the editor against a genuinely 0-row DataFrame: with
+# num_rows="dynamic", the very first cell ever committed into a 0-row
+# table gets silently coerced to a default (numeric cells commit as 0
+# regardless of what was typed) instead of the typed value — confirmed by
+# testing this exact app. Once at least one row exists, editing (including
+# adding further rows) works correctly. So a blank starter row is kept
+# topped up here — both on first load and if the user deletes every row —
+# to keep the table out of that 0-row state entirely.
+if len(st.session_state.positions_df) == 0:
+    st.session_state.positions_df = _typed(pd.DataFrame([{c: None for c in INPUT_COLUMNS}]))
+
 nse_json_mtime = os.path.getmtime(NSE_JSON_PATH) if os.path.exists(NSE_JSON_PATH) else 0
 
-# DateColumn requires an actual datetime dtype, not plain strings — the
-# JSON store keeps dates as ISO strings, so convert on the way into the editor.
-editor_input = st.session_state.positions_df.copy()
-for _dc in ('Entry Date', 'Expiry', 'Exit Date'):
-    editor_input[_dc] = pd.to_datetime(editor_input[_dc], errors='coerce')
-
 edited_df = st.data_editor(
-    editor_input,
+    st.session_state.positions_df,
     num_rows="dynamic",
     width='stretch',
     hide_index=True,
     key="positions_editor",
     column_config={
-        'S.no': st.column_config.NumberColumn('S.no', help="Same number for every leg of one strategy", step=1),
+        'S.no': st.column_config.NumberColumn('S.no', help="Same number for every leg of one strategy"),
         'Entry Date': st.column_config.DateColumn('Entry Date', format="DD-MM-YYYY"),
         'STRATEGY': st.column_config.TextColumn('STRATEGY', help="e.g. 2.1 BULL"),
         'SYMBOL': st.column_config.TextColumn('SYMBOL', help="e.g. KOTAKBANK"),
-        'STRIKE': st.column_config.TextColumn('STRIKE', help="e.g. 420 CE"),
-        'Expiry': st.column_config.DateColumn('Expiry', format="DD-MM-YYYY", help="Option expiry — needed to fetch LTP/lot size"),
+        'STRIKE': st.column_config.TextColumn('STRIKE', help="e.g. 420 CE — matched to whichever expiry is currently live"),
         'Qty': st.column_config.NumberColumn('Qty', step=1),
         'entry': st.column_config.NumberColumn('entry', format="%.2f"),
         'exit': st.column_config.NumberColumn('exit', format="%.2f", help="Leave blank while the position is open"),
@@ -323,22 +363,19 @@ edited_df = st.data_editor(
     }
 )
 
-# Normalize the edited datetime columns back to plain 'YYYY-MM-DD' strings
-# for storage/comparison/downstream lookups.
-for _dc in ('Entry Date', 'Expiry', 'Exit Date'):
-    edited_df[_dc] = pd.to_datetime(edited_df[_dc], errors='coerce').dt.strftime('%Y-%m-%d')
-    edited_df[_dc] = edited_df[_dc].where(edited_df[_dc].notna(), None)
-
+# Feed the widget's own output straight back in as next rerun's "data" —
+# unchanged, same dtypes — instead of rebuilding/re-typing it from disk.
+# That's what kept the editor's internal row/column tracking stable.
 if not edited_df.equals(st.session_state.positions_df):
     st.session_state.positions_df = edited_df
     save_positions(edited_df)
 
 if edited_df.dropna(how='all').empty:
-    st.info("Add a row above for each leg of a position (S.no, dates, strategy, symbol, strike e.g. '420 CE', expiry, qty, entry). LTP and lot Size fill in automatically once a token and NSE.json are available.")
+    st.info("Add a row above for each leg of a position (S.no, dates, strategy, symbol, strike e.g. '420 CE', qty, entry). The current expiry, LTP and lot Size fill in automatically once NSE.json (and a token, for LTP) are available.")
     st.stop()
 
 # ============================================================
-# Compute: resolve instrument -> lot size + LTP -> points/invest/profit
+# Compute: resolve instrument (current expiry) -> lot size + LTP -> points/invest/profit
 # ============================================================
 work = edited_df.dropna(subset=['SYMBOL', 'STRIKE']).copy()
 
@@ -346,18 +383,20 @@ strike_parsed = work['STRIKE'].apply(parse_strike)
 work['_strike_price'] = strike_parsed.apply(lambda t: t[0])
 work['_option_type'] = strike_parsed.apply(lambda t: t[1])
 
+today_str = get_ist_now().strftime('%Y-%m-%d')
 resolved = work.apply(
-    lambda r: resolve_instrument(r['SYMBOL'], r['_strike_price'], r['_option_type'], r['Expiry'], nse_json_mtime),
+    lambda r: resolve_instrument(r['SYMBOL'], r['_strike_price'], r['_option_type'], today_str, nse_json_mtime),
     axis=1
 )
 work['instrument_key'] = resolved.apply(lambda t: t[0])
 work['lot Size'] = resolved.apply(lambda t: t[1])
+work['Expiry'] = resolved.apply(lambda t: t[2])
 
 unresolved = work[work['instrument_key'].isna() & work['SYMBOL'].notna() & work['_strike_price'].notna()]
 if not unresolved.empty:
     st.warning(
-        f"{len(unresolved)} row(s) couldn't be matched in NSE.json (check SYMBOL / STRIKE like '420 CE' / Expiry). "
-        "LTP and lot Size will show 0 for those rows until they resolve."
+        f"{len(unresolved)} row(s) couldn't be matched to a live contract in NSE.json (check SYMBOL / STRIKE like '420 CE' — "
+        "there may be no unexpired listing at that strike). LTP and lot Size will show 0 for those rows."
     )
 
 # --- Live LTP ---
@@ -403,11 +442,13 @@ work['profit%'] = (work['Net Profit'] / work['Net Invest'].replace(0, pd.NA) * 1
 # Display — same column order as the reference sheet, LTP after entry
 # ============================================================
 display_cols = [
-    'S.no', 'Entry Date', 'STRATEGY', 'SYMBOL', 'STRIKE', 'lot Size', 'Qty',
+    'S.no', 'Entry Date', 'STRATEGY', 'SYMBOL', 'STRIKE', 'Expiry', 'lot Size', 'Qty',
     'entry', 'LTP', 'exit', 'points', 'invest', 'profit',
     'Net Invest', 'Net Profit', 'profit%', 'Exit Date', 'remarks'
 ]
 show_df = work[display_cols].copy()
+for _dc in ('Entry Date', 'Expiry', 'Exit Date'):
+    show_df[_dc] = pd.to_datetime(show_df[_dc], errors='coerce').dt.strftime('%d-%m-%Y')
 
 open_pos = int(work['_is_open'].sum())
 total_invest = work.drop_duplicates('S.no')['Net Invest'].sum()
