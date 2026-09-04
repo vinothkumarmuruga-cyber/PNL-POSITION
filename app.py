@@ -11,7 +11,7 @@ import concurrent.futures
 from datetime import datetime, timedelta, timezone
 
 # ============================================================
-# IST helpers (same convention as the OTM Positional Scanner)
+# IST helpers
 # ============================================================
 IST_OFFSET = timedelta(hours=5, minutes=30)
 IST = timezone(IST_OFFSET)
@@ -21,7 +21,7 @@ def get_ist_now():
     return datetime.now(IST)
 
 
-st.set_page_config(page_title="Positional PNL Tracker", layout="wide")
+st.set_page_config(page_title="Hedge PNL Tracker", layout="wide")
 
 st.markdown("""
     <style>
@@ -32,10 +32,13 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ============================================================
-# Persistence — same data/ folder + NSE.json the scanner already uses.
-# Run this file from the same folder as the OTM Positional Scanner
-# (e.g. as a second page: pages/2_PNL_Tracker.py) so it can reuse the
-# already-downloaded NSE.json and the saved Upstox token.
+# SIMPLE BY DESIGN
+#
+# Every position here is exactly one hedge: one symbol, a CE leg and a PE
+# leg. No spreadsheet-style editable grid — that's what kept breaking
+# (Streamlit's st.data_editor has real, reproducible bugs around dynamic
+# rows and date/number columns). Instead: fill a form to open a position,
+# fill a small form to close it. Plain widgets, no fragile grid.
 # ============================================================
 DATA_DIR = 'data'
 if not os.path.exists(DATA_DIR):
@@ -43,20 +46,12 @@ if not os.path.exists(DATA_DIR):
 
 TOKEN_FILE = os.path.join(DATA_DIR, 'token.json')
 LTP_CACHE_FILE = os.path.join(DATA_DIR, 'ltp_cache.json')
-POSITIONS_FILE = os.path.join(DATA_DIR, 'pnl_positions.json')
+POSITIONS_FILE = os.path.join(DATA_DIR, 'hedge_positions.json')
 NSE_JSON_PATH = 'NSE.json'
-
-# Editable input columns — this is ALL the user ever types in. No Expiry
-# column: the contract is always resolved against the CURRENT (nearest
-# live, expiry >= today) expiry for that symbol/strike/type automatically.
-INPUT_COLUMNS = [
-    'S.no', 'Entry Date', 'STRATEGY', 'SYMBOL', 'STRIKE',
-    'Qty', 'entry', 'exit', 'Exit Date', 'remarks'
-]
 
 
 # ============================================================
-# Token (shared with the scanner — reuse if already saved today)
+# Token
 # ============================================================
 def load_token():
     if os.path.exists(TOKEN_FILE):
@@ -79,7 +74,7 @@ def save_token(token):
 
 
 # ============================================================
-# LTP cache (shared file with the scanner — same instrument_token keys)
+# LTP cache + fetch
 # ============================================================
 def load_ltp_cache():
     if os.path.exists(LTP_CACHE_FILE):
@@ -102,7 +97,6 @@ def save_ltp_cache(new_data):
 
 
 def fetch_ltp(instrument_keys, token):
-    """Batch LTP fetch via Upstox v3 — identical logic to the scanner."""
     if not token or not instrument_keys:
         return {}
     url = "https://api.upstox.com/v3/market-quote/ltp"
@@ -142,8 +136,8 @@ def fetch_ltp(instrument_keys, token):
 
 
 # ============================================================
-# NSE instrument master — same file/shape the scanner downloads.
-# Used ONLY to auto-resolve instrument_key + lot_size for a leg.
+# NSE instrument master — only needed when OPENING a new position
+# (to resolve instrument_key + lot_size for the current expiry).
 # ============================================================
 @st.cache_data
 def load_nse_json():
@@ -161,33 +155,16 @@ def load_nse_json():
         return pd.DataFrame()
 
 
-STRIKE_RE = re.compile(r'(\d+(?:\.\d+)?)\s*(CE|PE)', re.IGNORECASE)
-
-
-def parse_strike(strike_text):
-    """'420 CE' / '420CE' -> (420.0, 'CE'). Returns (None, None) if unparsable."""
-    if not strike_text or not isinstance(strike_text, str):
-        return None, None
-    m = STRIKE_RE.search(strike_text.strip())
-    if not m:
-        return None, None
-    return round(float(m.group(1)), 2), m.group(2).upper()
-
-
 @st.cache_data(show_spinner=False, ttl=300)
-def resolve_instrument(symbol, strike, option_type, today_str, _nse_json_mtime):
+def resolve_current_contract(symbol, strike, option_type, today_str):
     """
-    Auto-resolves the CURRENT contract for this symbol/strike/option-type
-    from NSE.json — no Expiry input. "Current" = the nearest expiry that
-    hasn't lapsed yet (min expiry_dt >= today) among that symbol's listed
-    contracts at this strike/type. today_str is passed in (rather than
-    read live inside) purely so the cache key rolls over at midnight
-    IST — same lookup otherwise re-runs stale after an overnight rollover.
-    _nse_json_mtime busts the cache when NSE.json is re-downloaded.
-    Returns (instrument_key, lot_size, expiry_dt) or (None, None, None).
+    Current (nearest unexpired) contract for symbol/strike/type.
+    Returns (instrument_key, lot_size, expiry_str) or (None, None, None).
+    Resolved ONCE when a position is opened and then stored with it — a
+    live position's contract doesn't need to keep re-resolving itself.
     """
     df = load_nse_json()
-    if df.empty or symbol is None or strike is None or option_type is None:
+    if df.empty or not symbol or strike is None or not option_type:
         return None, None, None
     today = pd.to_datetime(today_str).normalize()
     match = df[
@@ -202,76 +179,42 @@ def resolve_instrument(symbol, strike, option_type, today_str, _nse_json_mtime):
     inst_key = row.get('instrument_key')
     lot_size = row.get('lot_size')
     lot_size = int(lot_size) if pd.notna(lot_size) else None
-    return inst_key, lot_size, row.get('expiry_dt')
+    expiry_dt = row.get('expiry_dt')
+    expiry_str = expiry_dt.strftime('%Y-%m-%d') if pd.notna(expiry_dt) else None
+    return inst_key, lot_size, expiry_str
 
 
 # ============================================================
-# Position storage
+# Position storage — a plain list of dicts, one per hedge (CE+PE legs
+# baked in together). No dataframe editing involved anywhere, so none of
+# the data_editor dtype/row fragility applies here.
 # ============================================================
-DATE_COLS = ('Entry Date', 'Exit Date')
-NUMERIC_COLS = ('S.no', 'Qty', 'entry', 'exit')
-
-
-def _typed(df):
-    """
-    Forces real datetime/float64 dtype onto the date and numeric columns.
-    This matters even for a brand-new, all-empty DataFrame: a column that's
-    all-None defaults to pandas' generic 'object' dtype, and data_editor's
-    DateColumn/NumberColumn need a matching real dtype to edit correctly —
-    DateColumn just errors on a mismatch (loud), but NumberColumn on an
-    object-dtype column silently coerces whatever you type to 0 instead of
-    raising (that's what was turning a typed '1' into a stored '0'). Always
-    normalizing dtype here, on both the loaded-from-disk and brand-new
-    paths, is what avoids both failure modes.
-    """
-    for dc in DATE_COLS:
-        df[dc] = pd.to_datetime(df[dc], errors='coerce')
-    for nc in NUMERIC_COLS:
-        df[nc] = pd.to_numeric(df[nc], errors='coerce').astype('float64')
-    return df
-
-
 def load_positions():
-    """
-    Loads positions from disk with columns already typed correctly (see
-    _typed). This is the ONLY place that reads from the JSON file — after
-    this, the in-memory st.session_state.positions_df is the single source
-    of truth for the rest of the session; we never rebuild it from disk
-    mid-session, since handing st.data_editor a freshly reconstructed /
-    re-typed DataFrame on every rerun (instead of feeding back exactly
-    what it last returned) is what was scrambling rows between legs.
-    """
     if os.path.exists(POSITIONS_FILE):
         try:
             with open(POSITIONS_FILE, 'r') as f:
-                data = json.load(f)
-            df = pd.DataFrame(data)
-            for c in INPUT_COLUMNS:
-                if c not in df.columns:
-                    df[c] = None
-            return _typed(df[INPUT_COLUMNS].copy())
+                return json.load(f)
         except Exception:
             pass
-    return _typed(pd.DataFrame(columns=INPUT_COLUMNS))
+    return []
 
 
-def save_positions(df):
-    """Writes a JSON-safe copy to disk. Never mutates df itself — the
-    caller's (datetime-typed) DataFrame keeps being fed straight back
-    into st.data_editor unchanged."""
+def save_positions(positions):
     try:
-        clean = df.copy()
-        for dc in DATE_COLS:
-            clean[dc] = pd.to_datetime(clean[dc], errors='coerce').dt.strftime('%Y-%m-%d')
-        clean = clean.where(pd.notna(clean), None)
         with open(POSITIONS_FILE, 'w') as f:
-            json.dump(clean.to_dict(orient='records'), f, default=str)
+            json.dump(positions, f, indent=2, default=str)
     except Exception as e:
         st.error(f"Could not save positions: {e}")
 
 
+def next_sno(positions):
+    if not positions:
+        return 1
+    return max(p.get('sno', 0) for p in positions) + 1
+
+
 # ============================================================
-# Sidebar — token, NSE.json refresh, auto-refresh
+# Sidebar
 # ============================================================
 with st.sidebar:
     st.header("Configuration")
@@ -280,18 +223,9 @@ with st.sidebar:
     if access_token and access_token != saved_token:
         save_token(access_token)
 
-    st.caption(
-        "Only **Expiry**, **lot Size** and **LTP** are filled in "
-        "automatically — Expiry always auto-picks the CURRENT (nearest "
-        "unexpired) contract for that symbol/strike from NSE.json, lot "
-        "Size comes from the same lookup, and LTP is live from Upstox. "
-        "Everything else — dates, strategy, symbol, strike, qty, entry, "
-        "exit, remarks — you type in the table."
-    )
-
     st.markdown("---")
     st.subheader("NSE Instrument JSON")
-    st.caption(f"{'✅ Found' if os.path.exists(NSE_JSON_PATH) else '❌ Missing'}: {NSE_JSON_PATH}")
+    st.caption(f"{'✅ Found' if os.path.exists(NSE_JSON_PATH) else '❌ Missing'}: {NSE_JSON_PATH} (needed only to open new positions)")
     if st.button("🔄 Download Latest NSE.json", use_container_width=True):
         try:
             with st.spinner("Downloading NSE.json from Upstox..."):
@@ -316,95 +250,88 @@ with st.sidebar:
     auto_refresh = st.checkbox("Enable Auto-Refresh", value=False)
     refresh_interval = st.slider("Refresh Interval (seconds)", min_value=5, max_value=60, value=15)
 
-
 # ============================================================
 # Main page
 # ============================================================
-st.title("Positional PNL Tracker")
-st.caption(
-    "Give the same **S.no** to every leg of one strategy (e.g. both the "
-    "CE and PE row of a spread) — Net Invest / Net Profit / profit% are "
-    "totalled across all legs that share an S.no."
-)
+st.title("Hedge PNL Tracker")
+st.caption("Every position = one symbol, one CE leg, one PE leg. LTP is the only thing pulled from the API automatically.")
 
-if 'positions_df' not in st.session_state:
-    st.session_state.positions_df = load_positions()
+positions = load_positions()
 
-# Never render the editor against a genuinely 0-row DataFrame: with
-# num_rows="dynamic", the very first cell ever committed into a 0-row
-# table gets silently coerced to a default (numeric cells commit as 0
-# regardless of what was typed) instead of the typed value — confirmed by
-# testing this exact app. Once at least one row exists, editing (including
-# adding further rows) works correctly. So a blank starter row is kept
-# topped up here — both on first load and if the user deletes every row —
-# to keep the table out of that 0-row state entirely.
-if len(st.session_state.positions_df) == 0:
-    st.session_state.positions_df = _typed(pd.DataFrame([{c: None for c in INPUT_COLUMNS}]))
+# ------------------------------------------------------------
+# Open a new position
+# ------------------------------------------------------------
+with st.expander("➕ Add Position", expanded=(len(positions) == 0)):
+    with st.form("add_position_form", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        entry_date = c1.date_input("Entry Date", value=get_ist_now().date())
+        symbol = c2.text_input("Symbol", placeholder="e.g. KOTAKBANK").strip().upper()
 
-nse_json_mtime = os.path.getmtime(NSE_JSON_PATH) if os.path.exists(NSE_JSON_PATH) else 0
+        st.markdown("**CE leg**")
+        ce1, ce2, ce3, ce4 = st.columns(4)
+        ce_strike = ce1.number_input("CE Strike", min_value=0.0, step=0.5, format="%.1f", key="ce_strike")
+        ce_entry = ce2.number_input("CE Entry", min_value=0.0, step=0.05, format="%.2f", key="ce_entry")
+        ce_tgt = ce3.number_input("CE TGT", min_value=0.0, step=0.05, format="%.2f", key="ce_tgt")
+        ce_qty = ce4.number_input("CE Qty", min_value=1, step=1, value=1, key="ce_qty")
 
-edited_df = st.data_editor(
-    st.session_state.positions_df,
-    num_rows="dynamic",
-    width='stretch',
-    hide_index=True,
-    key="positions_editor",
-    column_config={
-        'S.no': st.column_config.NumberColumn('S.no', help="Same number for every leg of one strategy"),
-        'Entry Date': st.column_config.DateColumn('Entry Date', format="DD-MM-YYYY"),
-        'STRATEGY': st.column_config.TextColumn('STRATEGY', help="e.g. 2.1 BULL"),
-        'SYMBOL': st.column_config.TextColumn('SYMBOL', help="e.g. KOTAKBANK"),
-        'STRIKE': st.column_config.TextColumn('STRIKE', help="e.g. 420 CE — matched to whichever expiry is currently live"),
-        'Qty': st.column_config.NumberColumn('Qty', step=1),
-        'entry': st.column_config.NumberColumn('entry', format="%.2f"),
-        'exit': st.column_config.NumberColumn('exit', format="%.2f", help="Leave blank while the position is open"),
-        'Exit Date': st.column_config.DateColumn('Exit Date', format="DD-MM-YYYY"),
-        'remarks': st.column_config.TextColumn('remarks'),
-    }
-)
+        st.markdown("**PE leg**")
+        pe1, pe2, pe3, pe4 = st.columns(4)
+        pe_strike = pe1.number_input("PE Strike", min_value=0.0, step=0.5, format="%.1f", key="pe_strike")
+        pe_entry = pe2.number_input("PE Entry", min_value=0.0, step=0.05, format="%.2f", key="pe_entry")
+        pe_tgt = pe3.number_input("PE TGT", min_value=0.0, step=0.05, format="%.2f", key="pe_tgt")
+        pe_qty = pe4.number_input("PE Qty", min_value=1, step=1, value=1, key="pe_qty")
 
-# Feed the widget's own output straight back in as next rerun's "data" —
-# unchanged, same dtypes — instead of rebuilding/re-typing it from disk.
-# That's what kept the editor's internal row/column tracking stable.
-if not edited_df.equals(st.session_state.positions_df):
-    st.session_state.positions_df = edited_df
-    save_positions(edited_df)
+        remarks = st.text_input("Remarks", value="")
 
-if edited_df.dropna(how='all').empty:
-    st.info("Add a row above for each leg of a position (S.no, dates, strategy, symbol, strike e.g. '420 CE', qty, entry). The current expiry, LTP and lot Size fill in automatically once NSE.json (and a token, for LTP) are available.")
+        submitted = st.form_submit_button("Add Position", use_container_width=True)
+
+        if submitted:
+            if not symbol or ce_strike <= 0 or pe_strike <= 0 or ce_entry <= 0 or pe_entry <= 0:
+                st.error("Symbol, both strikes and both entry prices are required.")
+            else:
+                today_str = get_ist_now().strftime('%Y-%m-%d')
+                ce_key, lot_size, expiry_str = resolve_current_contract(symbol, ce_strike, "CE", today_str)
+                pe_key, pe_lot_size, _ = resolve_current_contract(symbol, pe_strike, "PE", today_str)
+                lot_size = lot_size or pe_lot_size
+                if not ce_key or not pe_key:
+                    st.warning(
+                        "Couldn't match one or both legs to a live contract in NSE.json "
+                        "(download it in the sidebar first). Position added anyway — "
+                        "LTP will show 0 until it resolves."
+                    )
+                new_pos = {
+                    'sno': next_sno(positions),
+                    'entry_date': str(entry_date),
+                    'symbol': symbol,
+                    'lot_size': lot_size or 0,
+                    'expiry': expiry_str,
+                    'ce_strike': ce_strike, 'ce_entry': ce_entry, 'ce_tgt': ce_tgt,
+                    'ce_qty': int(ce_qty), 'ce_exit': None, 'ce_instrument_key': ce_key,
+                    'pe_strike': pe_strike, 'pe_entry': pe_entry, 'pe_tgt': pe_tgt,
+                    'pe_qty': int(pe_qty), 'pe_exit': None, 'pe_instrument_key': pe_key,
+                    'exit_date': None,
+                    'remarks': remarks,
+                }
+                positions.append(new_pos)
+                save_positions(positions)
+                st.success(f"Added S.no {new_pos['sno']} — {symbol}")
+                st.rerun()
+
+if not positions:
+    st.info("No positions yet. Use **Add Position** above to open your first hedge.")
     st.stop()
 
-# ============================================================
-# Compute: resolve instrument (current expiry) -> lot size + LTP -> points/invest/profit
-# ============================================================
-work = edited_df.dropna(subset=['SYMBOL', 'STRIKE']).copy()
-
-strike_parsed = work['STRIKE'].apply(parse_strike)
-work['_strike_price'] = strike_parsed.apply(lambda t: t[0])
-work['_option_type'] = strike_parsed.apply(lambda t: t[1])
-
-today_str = get_ist_now().strftime('%Y-%m-%d')
-resolved = work.apply(
-    lambda r: resolve_instrument(r['SYMBOL'], r['_strike_price'], r['_option_type'], today_str, nse_json_mtime),
-    axis=1
-)
-work['instrument_key'] = resolved.apply(lambda t: t[0])
-work['lot Size'] = resolved.apply(lambda t: t[1])
-work['Expiry'] = resolved.apply(lambda t: t[2])
-
-unresolved = work[work['instrument_key'].isna() & work['SYMBOL'].notna() & work['_strike_price'].notna()]
-if not unresolved.empty:
-    st.warning(
-        f"{len(unresolved)} row(s) couldn't be matched to a live contract in NSE.json (check SYMBOL / STRIKE like '420 CE' — "
-        "there may be no unexpired listing at that strike). LTP and lot Size will show 0 for those rows."
-    )
-
-# --- Live LTP ---
-all_keys = work['instrument_key'].dropna().unique().tolist()
+# ------------------------------------------------------------
+# Live LTP for every open leg
+# ------------------------------------------------------------
+all_keys = sorted({
+    p[k] for p in positions for k in ('ce_instrument_key', 'pe_instrument_key')
+    if p.get(k)
+})
+ltp_cache = load_ltp_cache()
 if access_token and all_keys:
     ist_now = get_ist_now()
     is_market_hours = datetime.strptime("09:00", "%H:%M").time() <= ist_now.time() <= datetime.strptime("15:40", "%H:%M").time()
-    ltp_cache = load_ltp_cache()
     missing_keys = [k for k in all_keys if k not in ltp_cache]
     keys_to_fetch = all_keys if is_market_hours else missing_keys
     if keys_to_fetch:
@@ -412,51 +339,73 @@ if access_token and all_keys:
         if fetched:
             save_ltp_cache(fetched)
             ltp_cache = load_ltp_cache()
-    work['LTP'] = work['instrument_key'].map(lambda k: ltp_cache.get(k, 0.0) if pd.notna(k) else 0.0)
-else:
-    work['LTP'] = 0.0
-    if not access_token:
-        st.warning("Enter your Upstox Access Token in the sidebar to fetch live LTP.")
+elif not access_token:
+    st.warning("Enter your Upstox Access Token in the sidebar to see live LTP.")
 
-work['lot Size'] = work['lot Size'].fillna(0).astype(int)
-work['entry'] = pd.to_numeric(work['entry'], errors='coerce').fillna(0.0)
-work['exit'] = pd.to_numeric(work['exit'], errors='coerce')
-work['Qty'] = pd.to_numeric(work['Qty'], errors='coerce').fillna(0).astype(int)
 
-# Open position -> mark-to-market against live LTP. Closed -> use actual exit.
-work['_is_open'] = work['exit'].isna()
-work['_effective_exit'] = work['exit'].where(~work['_is_open'], work['LTP'])
+def leg_ltp(inst_key):
+    return float(ltp_cache.get(inst_key, 0.0)) if inst_key else 0.0
 
-# points = (exit - entry) * Qty   |   invest = entry * lotSize * Qty   |   profit = points * lotSize
-work['points'] = (work['_effective_exit'] - work['entry']) * work['Qty']
-work['invest'] = work['entry'] * work['lot Size'] * work['Qty']
-work['profit'] = work['points'] * work['lot Size']
 
-# Position-level totals, grouped by S.no, broadcast back onto every leg
-totals = work.groupby('S.no')[['invest', 'profit']].transform('sum')
-work['Net Invest'] = totals['invest']
-work['Net Profit'] = totals['profit']
-work['profit%'] = (work['Net Profit'] / work['Net Invest'].replace(0, pd.NA) * 100).fillna(0.0)
+# ------------------------------------------------------------
+# Build the display table — two rows (CE, PE) per position, same
+# column layout as before with TGT added right before exit.
+# ------------------------------------------------------------
+rows = []
+for p in positions:
+    lot = p.get('lot_size') or 0
+    for leg in ('ce', 'pe'):
+        entry = float(p.get(f'{leg}_entry') or 0)
+        exit_ = p.get(f'{leg}_exit')
+        exit_ = float(exit_) if exit_ not in (None, '') else None
+        qty = int(p.get(f'{leg}_qty') or 0)
+        ltp = leg_ltp(p.get(f'{leg}_instrument_key'))
+        is_open = exit_ is None
+        effective_exit = ltp if is_open else exit_
+        points = (effective_exit - entry) * qty
+        invest = entry * lot * qty
+        profit = points * lot
+        rows.append({
+            'S.no': p['sno'],
+            'Entry Date': p.get('entry_date'),
+            'SYMBOL': p['symbol'],
+            'STRIKE': f"{p[f'{leg}_strike']:.0f} {leg.upper()}",
+            'lot Size': lot,
+            'Qty': qty,
+            'entry': entry,
+            'LTP': ltp,
+            'TGT': float(p.get(f'{leg}_tgt') or 0),
+            'exit': exit_,
+            'points': points,
+            'invest': invest,
+            'profit': profit,
+            'Exit Date': p.get('exit_date'),
+            'remarks': p.get('remarks') or '',
+            '_is_open': is_open,
+        })
 
-# ============================================================
-# Display — same column order as the reference sheet, LTP after entry
-# ============================================================
+df = pd.DataFrame(rows)
+totals = df.groupby('S.no')[['invest', 'profit']].transform('sum')
+df['Net Invest'] = totals['invest']
+df['Net Profit'] = totals['profit']
+df['profit%'] = (df['Net Profit'] / df['Net Invest'].replace(0, pd.NA) * 100).fillna(0.0)
+
 display_cols = [
-    'S.no', 'Entry Date', 'STRATEGY', 'SYMBOL', 'STRIKE', 'Expiry', 'lot Size', 'Qty',
-    'entry', 'LTP', 'exit', 'points', 'invest', 'profit',
+    'S.no', 'Entry Date', 'SYMBOL', 'STRIKE', 'lot Size', 'Qty',
+    'entry', 'LTP', 'TGT', 'exit', 'points', 'invest', 'profit',
     'Net Invest', 'Net Profit', 'profit%', 'Exit Date', 'remarks'
 ]
-show_df = work[display_cols].copy()
-for _dc in ('Entry Date', 'Expiry', 'Exit Date'):
-    show_df[_dc] = pd.to_datetime(show_df[_dc], errors='coerce').dt.strftime('%d-%m-%Y')
+show_df = df[display_cols].copy()
+for dc in ('Entry Date', 'Exit Date'):
+    show_df[dc] = pd.to_datetime(show_df[dc], errors='coerce').dt.strftime('%d-%m-%Y')
 
-open_pos = int(work['_is_open'].sum())
-total_invest = work.drop_duplicates('S.no')['Net Invest'].sum()
-total_profit = work.drop_duplicates('S.no')['Net Profit'].sum()
+open_legs = int(df['_is_open'].sum())
+total_invest = df.drop_duplicates('S.no')['Net Invest'].sum()
+total_profit = df.drop_duplicates('S.no')['Net Profit'].sum()
 overall_pct = (total_profit / total_invest * 100) if total_invest else 0.0
 
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("Open Legs", open_pos)
+m1.metric("Open Legs", open_legs)
 m2.metric("Total Invested", f"₹{total_invest:,.0f}")
 m3.metric("Total Net Profit", f"₹{total_profit:,.0f}")
 m4.metric("Overall %", f"{overall_pct:.1f}%")
@@ -472,16 +421,28 @@ def color_pnl(val):
     return ''
 
 
+def color_tgt_hit(row):
+    # Highlight LTP once it has reached that leg's TGT.
+    styles = [''] * len(row)
+    try:
+        ltp_idx = show_df.columns.get_loc('LTP')
+        if row['TGT'] > 0 and row['LTP'] >= row['TGT']:
+            styles[ltp_idx] = 'background-color: darkgreen; color: white; font-weight: 700'
+    except Exception:
+        pass
+    return styles
+
+
 format_dict = {
-    'entry': '{:.2f}', 'LTP': '{:.2f}', 'exit': '{:.2f}', 'points': '{:.2f}',
+    'entry': '{:.2f}', 'LTP': '{:.2f}', 'TGT': '{:.2f}', 'exit': '{:.2f}', 'points': '{:.2f}',
     'invest': '{:,.0f}', 'profit': '{:,.0f}', 'Net Invest': '{:,.0f}',
     'Net Profit': '{:,.0f}', 'profit%': '{:.1f}%'
 }
 
 styled = (
     show_df.style
+    .apply(color_tgt_hit, axis=1)
     .map(color_pnl, subset=['points', 'profit', 'Net Profit', 'profit%'])
-    .set_properties(subset=['STRATEGY'], **{'background-color': '#c6efce'})
     .set_properties(subset=['SYMBOL'], **{'background-color': '#dbeeff'})
     .format(format_dict, na_rep='—')
     .set_properties(**{'text-align': 'center', 'font-size': '15px'})
@@ -489,6 +450,52 @@ styled = (
 
 st.caption(f"Last Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
 st.dataframe(styled, hide_index=True, width='stretch', height=min(600, 60 + 40 * len(show_df)))
+
+# ------------------------------------------------------------
+# Close / edit a position — plain widgets, no grid editing.
+# ------------------------------------------------------------
+st.markdown("---")
+st.subheader("Close / Edit a Position")
+
+options = {f"S.no {p['sno']} — {p['symbol']}": p['sno'] for p in positions}
+choice = st.selectbox("Position", options=list(options.keys()))
+sel_sno = options[choice]
+pos = next(p for p in positions if p['sno'] == sel_sno)
+
+with st.form("edit_position_form"):
+    c1, c2 = st.columns(2)
+    ce_exit_val = c1.number_input(
+        "CE Exit", min_value=0.0, step=0.05, format="%.2f",
+        value=float(pos.get('ce_exit') or 0.0)
+    )
+    pe_exit_val = c2.number_input(
+        "PE Exit", min_value=0.0, step=0.05, format="%.2f",
+        value=float(pos.get('pe_exit') or 0.0)
+    )
+    exit_date_val = st.date_input(
+        "Exit Date",
+        value=pd.to_datetime(pos['exit_date']).date() if pos.get('exit_date') else get_ist_now().date()
+    )
+    remarks_val = st.text_input("Remarks", value=pos.get('remarks') or '')
+
+    save_col, delete_col = st.columns(2)
+    save_clicked = save_col.form_submit_button("💾 Save", use_container_width=True)
+    delete_clicked = delete_col.form_submit_button("🗑️ Delete Position", use_container_width=True)
+
+    if save_clicked:
+        pos['ce_exit'] = ce_exit_val if ce_exit_val > 0 else None
+        pos['pe_exit'] = pe_exit_val if pe_exit_val > 0 else None
+        pos['exit_date'] = str(exit_date_val) if (ce_exit_val > 0 or pe_exit_val > 0) else None
+        pos['remarks'] = remarks_val
+        save_positions(positions)
+        st.success(f"Saved S.no {sel_sno}")
+        st.rerun()
+
+    if delete_clicked:
+        positions = [p for p in positions if p['sno'] != sel_sno]
+        save_positions(positions)
+        st.success(f"Deleted S.no {sel_sno}")
+        st.rerun()
 
 if auto_refresh:
     time.sleep(refresh_interval)
