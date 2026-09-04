@@ -8,6 +8,7 @@ import time
 import gzip
 import shutil
 import concurrent.futures
+import html as html_lib
 from datetime import datetime, timedelta, timezone
 
 # ============================================================
@@ -348,13 +349,29 @@ def leg_ltp(inst_key):
 
 
 # ------------------------------------------------------------
-# Build the display table — ONE row per position (CE + PE as a single
-# basket): shared fields (date, symbol, lot) appear once, CE and PE legs
-# sit side by side, and Net Invest / Net Profit / profit% are the
-# combined basket P&L — that combined profit% is "my PNL%".
+# Build the display table — spreadsheet-style: one row PER LEG (CE, PE)
+# like the original Excel sheet, with the shared fields (S.no, Entry
+# Date, Symbol, lot Size, Net Invest, Net Profit, profit%, Exit Date,
+# Remarks) merged (rowspan) across the two leg rows instead of repeated.
 # ------------------------------------------------------------
-rows = []
-for p in positions:
+def esc(v):
+    return html_lib.escape(str(v))
+
+
+def pnl_style(val):
+    if val > 0:
+        return 'background-color:#d4edda;color:#155724;font-weight:700'
+    if val < 0:
+        return 'background-color:#f8d7da;color:#721c24;font-weight:700'
+    return ''
+
+
+open_legs = 0
+total_invest = 0.0
+total_profit = 0.0
+body_rows_html = []
+
+for pos_idx, p in enumerate(positions):
     lot = p.get('lot_size') or 0
     leg_calc = {}
     for leg in ('ce', 'pe'):
@@ -363,6 +380,7 @@ for p in positions:
         exit_ = float(exit_) if exit_ not in (None, '') else None
         qty = int(p.get(f'{leg}_qty') or 0)
         ltp = leg_ltp(p.get(f'{leg}_instrument_key'))
+        tgt = float(p.get(f'{leg}_tgt') or 0)
         is_open = exit_ is None
         effective_exit = ltp if is_open else exit_
         points = (effective_exit - entry) * qty
@@ -370,57 +388,56 @@ for p in positions:
         profit = points * lot
         leg_calc[leg] = {
             'strike': p[f'{leg}_strike'], 'qty': qty, 'entry': entry, 'ltp': ltp,
-            'tgt': float(p.get(f'{leg}_tgt') or 0), 'exit': exit_,
-            'invest': invest, 'profit': profit, 'is_open': is_open,
+            'tgt': tgt, 'exit': exit_, 'points': points, 'invest': invest,
+            'profit': profit, 'is_open': is_open,
         }
 
     net_invest = leg_calc['ce']['invest'] + leg_calc['pe']['invest']
     net_profit = leg_calc['ce']['profit'] + leg_calc['pe']['profit']
     if net_profit == 0:
         net_profit = 0.0  # avoid displaying "-0"
-    rows.append({
-        'S.no': p['sno'],
-        'Entry Date': p.get('entry_date'),
-        'SYMBOL': p['symbol'],
-        'lot Size': lot,
-        'CE Strike': f"{leg_calc['ce']['strike']:.0f} CE", 'CE Qty': leg_calc['ce']['qty'],
-        'CE Entry': leg_calc['ce']['entry'], 'CE LTP': leg_calc['ce']['ltp'],
-        'CE TGT': leg_calc['ce']['tgt'],
-        'CE Exit': f"{leg_calc['ce']['exit']:.2f}" if leg_calc['ce']['exit'] is not None else '—',
-        'PE Strike': f"{leg_calc['pe']['strike']:.0f} PE", 'PE Qty': leg_calc['pe']['qty'],
-        'PE Entry': leg_calc['pe']['entry'], 'PE LTP': leg_calc['pe']['ltp'],
-        'PE TGT': leg_calc['pe']['tgt'],
-        'PE Exit': f"{leg_calc['pe']['exit']:.2f}" if leg_calc['pe']['exit'] is not None else '—',
-        'Net Invest': net_invest,
-        'Net Profit': net_profit,
-        'profit%': (net_profit / net_invest * 100) if net_invest else 0.0,
-        'Exit Date': p.get('exit_date'),
-        'remarks': p.get('remarks') or '',
-        '_open_legs': int(leg_calc['ce']['is_open']) + int(leg_calc['pe']['is_open']),
-    })
+    net_pct = (net_profit / net_invest * 100) if net_invest else 0.0
 
-df = pd.DataFrame(rows)
+    open_legs += int(leg_calc['ce']['is_open']) + int(leg_calc['pe']['is_open'])
+    total_invest += net_invest
+    total_profit += net_profit
 
-display_cols = [
-    'S.no', 'Entry Date', 'SYMBOL', 'lot Size',
-    'CE Strike', 'CE Qty', 'CE Entry', 'CE LTP', 'CE TGT', 'CE Exit',
-    'PE Strike', 'PE Qty', 'PE Entry', 'PE LTP', 'PE TGT', 'PE Exit',
-    'Net Invest', 'Net Profit', 'profit%', 'Exit Date', 'remarks'
-]
-show_df = df[display_cols].copy()
-for dc in ('Entry Date', 'Exit Date'):
-    show_df[dc] = pd.to_datetime(show_df[dc], errors='coerce').dt.strftime('%d-%m-%Y')
-numeric_cols = [
-    'CE Entry', 'CE LTP', 'CE TGT',
-    'PE Entry', 'PE LTP', 'PE TGT',
-    'Net Invest', 'Net Profit', 'profit%'
-]
-for nc in numeric_cols:
-    show_df[nc] = pd.to_numeric(show_df[nc], errors='coerce').astype('float64')
+    entry_date_str = pd.to_datetime(p.get('entry_date'), errors='coerce')
+    entry_date_str = entry_date_str.strftime('%d-%m-%Y') if pd.notna(entry_date_str) else '—'
+    exit_date_str = pd.to_datetime(p.get('exit_date'), errors='coerce')
+    exit_date_str = exit_date_str.strftime('%d-%m-%Y') if pd.notna(exit_date_str) else '—'
 
-open_legs = int(df['_open_legs'].sum())
-total_invest = df['Net Invest'].sum()
-total_profit = df['Net Profit'].sum()
+    band = 'row-band-b' if pos_idx % 2 else 'row-band-a'
+
+    for i, leg in enumerate(('ce', 'pe')):
+        lc = leg_calc[leg]
+        tgt_hit = lc['tgt'] > 0 and lc['ltp'] >= lc['tgt']
+        ltp_style = 'background-color:#0b6623;color:#fff;font-weight:700' if tgt_hit else ''
+        exit_disp = f"{lc['exit']:.2f}" if lc['exit'] is not None else '—'
+
+        cells = []
+        if i == 0:
+            cells.append(f'<td rowspan="2" class="{band}">{p["sno"]}</td>')
+            cells.append(f'<td rowspan="2" class="{band}">{entry_date_str}</td>')
+            cells.append(f'<td rowspan="2" class="{band} sym-cell">{esc(p["symbol"])}</td>')
+            cells.append(f'<td rowspan="2" class="{band}">{lot}</td>')
+        cells.append(f'<td class="{band}">{lc["strike"]:.0f} {leg.upper()}</td>')
+        cells.append(f'<td class="{band}">{lc["qty"]}</td>')
+        cells.append(f'<td class="{band} entry-cell">{lc["entry"]:.2f}</td>')
+        cells.append(f'<td class="{band}" style="{ltp_style}">{lc["ltp"]:.2f}</td>')
+        cells.append(f'<td class="{band}">{lc["tgt"]:.2f}</td>')
+        cells.append(f'<td class="{band} exit-cell">{exit_disp}</td>')
+        cells.append(f'<td class="{band}" style="{pnl_style(lc["points"])}">{lc["points"]:.2f}</td>')
+        cells.append(f'<td class="{band}">{lc["invest"]:,.0f}</td>')
+        cells.append(f'<td class="{band}" style="{pnl_style(lc["profit"])}">{lc["profit"]:,.0f}</td>')
+        if i == 0:
+            cells.append(f'<td rowspan="2" class="{band}" style="{pnl_style(net_profit)}">{net_invest:,.0f}</td>')
+            cells.append(f'<td rowspan="2" class="{band}" style="{pnl_style(net_profit)}">{net_profit:,.0f}</td>')
+            cells.append(f'<td rowspan="2" class="{band}" style="{pnl_style(net_profit)}">{net_pct:.1f}%</td>')
+            cells.append(f'<td rowspan="2" class="{band}">{exit_date_str}</td>')
+            cells.append(f'<td rowspan="2" class="{band}">{esc(p.get("remarks") or "")}</td>')
+        body_rows_html.append('<tr>' + ''.join(cells) + '</tr>')
+
 overall_pct = (total_profit / total_invest * 100) if total_invest else 0.0
 
 m1, m2, m3, m4 = st.columns(4)
@@ -429,47 +446,45 @@ m2.metric("Total Invested", f"₹{total_invest:,.0f}")
 m3.metric("Total Net Profit", f"₹{total_profit:,.0f}")
 m4.metric("Overall PNL %", f"{overall_pct:.1f}%")
 
+st.markdown("""
+    <style>
+        .pnl-table-wrap { overflow-x: auto; border: 1px solid #d0d0d0; border-radius: 6px; }
+        table.pnl-table { border-collapse: collapse; width: 100%; font-size: 14px; white-space: nowrap; }
+        table.pnl-table th, table.pnl-table td {
+            border: 1px solid #d0d0d0; padding: 6px 10px; text-align: center;
+        }
+        table.pnl-table thead th {
+            background-color: #f4a261; color: #1a1a1a; font-weight: 700;
+            position: sticky; top: 0; z-index: 1;
+        }
+        table.pnl-table .row-band-a { background-color: #ffffff; }
+        table.pnl-table .row-band-b { background-color: #f7f9fb; }
+        table.pnl-table .sym-cell { background-color: #dbeeff !important; font-weight: 700; color: #0b3d91; }
+        table.pnl-table .entry-cell { background-color: #c6efce; font-weight: 600; }
+        table.pnl-table .exit-cell { background-color: #ffeb9c; font-weight: 600; }
+    </style>
+""", unsafe_allow_html=True)
 
-def color_pnl(val):
-    if not isinstance(val, (int, float)):
-        return ''
-    if val > 0:
-        return 'background-color: #d4edda; color: #155724; font-weight: 700'
-    if val < 0:
-        return 'background-color: #f8d7da; color: #721c24; font-weight: 700'
-    return ''
-
-
-def color_tgt_hit(row):
-    # Highlight each leg's LTP once it has reached that leg's own TGT.
-    styles = [''] * len(row)
-    try:
-        for leg_label in ('CE', 'PE'):
-            ltp_idx = show_df.columns.get_loc(f'{leg_label} LTP')
-            if row[f'{leg_label} TGT'] > 0 and row[f'{leg_label} LTP'] >= row[f'{leg_label} TGT']:
-                styles[ltp_idx] = 'background-color: darkgreen; color: white; font-weight: 700'
-    except Exception:
-        pass
-    return styles
-
-
-format_dict = {
-    'CE Entry': '{:.2f}', 'CE LTP': '{:.2f}', 'CE TGT': '{:.2f}',
-    'PE Entry': '{:.2f}', 'PE LTP': '{:.2f}', 'PE TGT': '{:.2f}',
-    'Net Invest': '{:,.0f}', 'Net Profit': '{:,.0f}', 'profit%': '{:.1f}%'
-}
-
-styled = (
-    show_df.style
-    .apply(color_tgt_hit, axis=1)
-    .map(color_pnl, subset=['Net Profit', 'profit%'])
-    .set_properties(subset=['SYMBOL'], **{'background-color': '#dbeeff'})
-    .format(format_dict, na_rep='—')
-    .set_properties(**{'text-align': 'center', 'font-size': '15px'})
-)
+table_html = f"""
+<div class="pnl-table-wrap">
+<table class="pnl-table">
+<thead>
+<tr>
+    <th>S.no</th><th>Entry Date</th><th>SYMBOL</th><th>lot Size</th>
+    <th>Strike</th><th>Qty</th><th>entry</th><th>LTP</th><th>TGT</th><th>exit</th>
+    <th>points</th><th>invest</th><th>profit</th>
+    <th>Net Invest</th><th>Net Profit</th><th>profit%</th><th>Exit Date</th><th>remarks</th>
+</tr>
+</thead>
+<tbody>
+{''.join(body_rows_html)}
+</tbody>
+</table>
+</div>
+"""
 
 st.caption(f"Last Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
-st.dataframe(styled, hide_index=True, width='stretch', height=min(600, 60 + 40 * len(show_df)))
+st.markdown(table_html, unsafe_allow_html=True)
 
 # ------------------------------------------------------------
 # Close / edit a position — plain widgets, no grid editing.
