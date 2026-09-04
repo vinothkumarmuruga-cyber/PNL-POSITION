@@ -417,6 +417,14 @@ def pnl_style(val):
     return ''
 
 
+def position_is_open(p):
+    return p.get('ce_exit') in (None, '') or p.get('pe_exit') in (None, '')
+
+
+# Open positions first (most actionable), closed positions after —
+# within each group the original add order (by S.no) is kept.
+positions_display = sorted(positions, key=lambda p: (not position_is_open(p), p.get('sno', 0)))
+
 open_legs = 0
 total_invest = 0.0
 total_profit = 0.0
@@ -425,7 +433,7 @@ export_rows = []
 alerts_changed = False
 alert_failures = []
 
-for pos_idx, p in enumerate(positions):
+for pos_idx, p in enumerate(positions_display):
     lot = p.get('lot_size') or 0
     leg_calc = {}
     for leg in ('ce', 'pe'):
@@ -504,7 +512,11 @@ for pos_idx, p in enumerate(positions):
     exit_date_str = pd.to_datetime(p.get('exit_date'), errors='coerce')
     exit_date_str = exit_date_str.strftime('%d-%m-%Y') if pd.notna(exit_date_str) else '—'
 
-    band = 'row-band-b' if pos_idx % 2 else 'row-band-a'
+    is_closed = pos_open_legs == 0
+    if is_closed:
+        band = 'row-profit' if net_profit > 0 else ('row-loss' if net_profit < 0 else 'row-band-a')
+    else:
+        band = 'row-band-b' if pos_idx % 2 else 'row-band-a'
 
     for i, leg in enumerate(('ce', 'pe')):
         lc = leg_calc[leg]
@@ -571,6 +583,8 @@ st.markdown("""
         }
         table.pnl-table .row-band-a { background-color: #ffffff; }
         table.pnl-table .row-band-b { background-color: #f7f9fb; }
+        table.pnl-table .row-profit { background-color: #d4edda; }
+        table.pnl-table .row-loss { background-color: #f8d7da; }
         table.pnl-table .sym-cell { background-color: #dbeeff !important; font-weight: 700; color: #0b3d91; }
         table.pnl-table .entry-cell { background-color: #c6efce; font-weight: 600; }
         table.pnl-table .exit-cell { background-color: #ffeb9c; font-weight: 600; }
