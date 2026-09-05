@@ -549,12 +549,11 @@ def pnl_style(val):
 open_legs = 0
 total_invest = 0.0
 total_profit = 0.0
-body_rows_html = []
-export_rows = []
 alerts_changed = False
 alert_failures = []
+enriched = []  # one entry per position, computed once, then filtered/sorted/rendered
 
-for pos_idx, p in enumerate(positions):
+for p in positions:
     lot = p.get('lot_size') or 0
     leg_calc = {}
     for leg in ('ce', 'pe'):
@@ -628,10 +627,99 @@ for pos_idx, p in enumerate(positions):
                 p['loss30_alerted'] = True
                 alerts_changed = True
 
-    entry_date_str = pd.to_datetime(p.get('entry_date'), errors='coerce')
-    entry_date_str = entry_date_str.strftime('%d-%m-%Y') if pd.notna(entry_date_str) else '—'
-    exit_date_str = pd.to_datetime(p.get('exit_date'), errors='coerce')
-    exit_date_str = exit_date_str.strftime('%d-%m-%Y') if pd.notna(exit_date_str) else '—'
+    entry_date_parsed = pd.to_datetime(p.get('entry_date'), errors='coerce')
+    exit_date_parsed = pd.to_datetime(p.get('exit_date'), errors='coerce')
+    entry_date_str = entry_date_parsed.strftime('%d-%m-%Y') if pd.notna(entry_date_parsed) else '—'
+    exit_date_str = exit_date_parsed.strftime('%d-%m-%Y') if pd.notna(exit_date_parsed) else '—'
+
+    enriched.append({
+        'p': p, 'leg_calc': leg_calc,
+        'net_invest': net_invest, 'net_profit': net_profit, 'net_pct': net_pct,
+        'is_open': pos_open_legs > 0,
+        'entry_date_str': entry_date_str, 'exit_date_str': exit_date_str,
+        'entry_date_sort': entry_date_parsed, 'exit_date_sort': exit_date_parsed,
+    })
+
+overall_pct = (total_profit / total_invest * 100) if total_invest else 0.0
+
+if alerts_changed:
+    save_positions(positions)
+if alert_failures:
+    st.warning("Telegram alert failed to send: " + "; ".join(alert_failures[:3]))
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Open Legs", open_legs)
+m2.metric("Total Invested", f"₹{total_invest:,.0f}")
+m3.metric("Total Net Profit", f"₹{total_profit:,.0f}")
+m4.metric("Overall PNL %", f"{overall_pct:.1f}%")
+
+# ------------------------------------------------------------
+# Search + sort — open positions always pinned above closed ones.
+# Metrics above stay computed on ALL positions; only the table below
+# reacts to search/sort.
+# ------------------------------------------------------------
+sc1, sc2, sc3 = st.columns([2, 2, 1])
+search_term = sc1.text_input("🔍 Search (S.no, symbol or remarks)", value="", placeholder="e.g. KOTAKBANK")
+sort_field = sc2.selectbox(
+    "Sort by",
+    ["S.no", "Symbol", "Entry Date", "Exit Date", "Net Invest", "Net Profit", "PNL %"],
+)
+sort_desc = sc3.checkbox("Descending", value=(sort_field in ("Net Profit", "PNL %")))
+
+_min_ts = pd.Timestamp.min
+SORT_KEYS = {
+    "S.no": lambda e: e['p']['sno'],
+    "Symbol": lambda e: e['p']['symbol'],
+    "Entry Date": lambda e: e['entry_date_sort'] if pd.notna(e['entry_date_sort']) else _min_ts,
+    "Exit Date": lambda e: e['exit_date_sort'] if pd.notna(e['exit_date_sort']) else _min_ts,
+    "Net Invest": lambda e: e['net_invest'],
+    "Net Profit": lambda e: e['net_profit'],
+    "PNL %": lambda e: e['net_pct'],
+}
+sort_key = SORT_KEYS[sort_field]
+
+term = search_term.strip().upper()
+if term:
+    filtered = [
+        e for e in enriched
+        if term in e['p']['symbol'].upper()
+        or term in (e['p'].get('remarks') or '').upper()
+        or term == str(e['p']['sno'])
+    ]
+else:
+    filtered = enriched
+
+# Open positions always float to the top, regardless of the chosen sort —
+# each group (open, then closed) is independently sorted by that field.
+open_group = sorted((e for e in filtered if e['is_open']), key=sort_key, reverse=sort_desc)
+closed_group = sorted((e for e in filtered if not e['is_open']), key=sort_key, reverse=sort_desc)
+display_list = open_group + closed_group
+
+if term and not display_list:
+    st.info(f"No positions match '{search_term}'.")
+elif term:
+    st.caption(f"Showing {len(display_list)} of {len(enriched)} positions. Excel download below always includes all of them, regardless of this search.")
+
+def _leg_row_dict(p, lot, leg, lc, entry_date_str, exit_date_str, net_invest, net_profit, net_pct):
+    exit_disp = f"{lc['exit']:.2f}" if lc['exit'] is not None else '—'
+    return {
+        'S.no': p['sno'], 'Entry Date': entry_date_str, 'SYMBOL': p['symbol'], 'lot Size': lot,
+        'Strike': f"{lc['strike']:.0f} {leg.upper()}", 'Qty': lc['qty'],
+        'entry': lc['entry'], 'LTP': lc['ltp'], 'TGT': lc['tgt'], 'exit': exit_disp,
+        'points': round(lc['points'], 2), 'invest': round(lc['invest'], 2),
+        'profit': round(lc['profit'], 2),
+        'Net Invest': round(net_invest, 2), 'Net Profit': round(net_profit, 2),
+        'profit%': round(net_pct, 2), 'Exit Date': exit_date_str,
+        'remarks': p.get('remarks') or '',
+    }
+
+# Table shown on screen — respects search + sort, open positions pinned first.
+body_rows_html = []
+for pos_idx, e in enumerate(display_list):
+    p, leg_calc = e['p'], e['leg_calc']
+    net_invest, net_profit, net_pct = e['net_invest'], e['net_profit'], e['net_pct']
+    entry_date_str, exit_date_str = e['entry_date_str'], e['exit_date_str']
+    lot = p.get('lot_size') or 0
 
     band = 'row-band-b' if pos_idx % 2 else 'row-band-a'
 
@@ -663,29 +751,21 @@ for pos_idx, p in enumerate(positions):
             cells.append(f'<td rowspan="2" class="{band}">{esc(p.get("remarks") or "")}</td>')
         body_rows_html.append('<tr>' + ''.join(cells) + '</tr>')
 
-        export_rows.append({
-            'S.no': p['sno'], 'Entry Date': entry_date_str, 'SYMBOL': p['symbol'], 'lot Size': lot,
-            'Strike': f"{lc['strike']:.0f} {leg.upper()}", 'Qty': lc['qty'],
-            'entry': lc['entry'], 'LTP': lc['ltp'], 'TGT': lc['tgt'], 'exit': exit_disp,
-            'points': round(lc['points'], 2), 'invest': round(lc['invest'], 2),
-            'profit': round(lc['profit'], 2),
-            'Net Invest': round(net_invest, 2), 'Net Profit': round(net_profit, 2),
-            'profit%': round(net_pct, 2), 'Exit Date': exit_date_str,
-            'remarks': p.get('remarks') or '',
-        })
-
-overall_pct = (total_profit / total_invest * 100) if total_invest else 0.0
-
-if alerts_changed:
-    save_positions(positions)
-if alert_failures:
-    st.warning("Telegram alert failed to send: " + "; ".join(alert_failures[:3]))
-
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Open Legs", open_legs)
-m2.metric("Total Invested", f"₹{total_invest:,.0f}")
-m3.metric("Total Net Profit", f"₹{total_profit:,.0f}")
-m4.metric("Overall PNL %", f"{overall_pct:.1f}%")
+# Excel export — deliberately ALWAYS covers every position, ignoring the
+# search box, so "Download as Excel" stays a full backup no matter what's
+# currently filtered on screen. (This is also what "Restore from Excel
+# Backup" logic elsewhere reads back in — it must never be a partial file.)
+export_open = sorted((e for e in enriched if e['is_open']), key=sort_key, reverse=sort_desc)
+export_closed = sorted((e for e in enriched if not e['is_open']), key=sort_key, reverse=sort_desc)
+export_rows = []
+for e in export_open + export_closed:
+    p, leg_calc = e['p'], e['leg_calc']
+    lot = p.get('lot_size') or 0
+    for leg in ('ce', 'pe'):
+        export_rows.append(_leg_row_dict(
+            p, lot, leg, leg_calc[leg], e['entry_date_str'], e['exit_date_str'],
+            e['net_invest'], e['net_profit'], e['net_pct']
+        ))
 
 st.markdown("""
     <style>
