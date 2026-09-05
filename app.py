@@ -668,19 +668,37 @@ for pos_idx, e in enumerate(initial_order):
         'ce_profit': round(ce['profit'], 2),
     }
     vals_attr = html_lib.escape(json.dumps(sort_vals), quote=True)
-    band = 'row-band-b' if pos_idx % 2 else 'row-band-a'
+
+    # Closed positions get their ENTIRE row colored by outcome (green =
+    # profit, red = loss) instead of the usual alternating white/grey
+    # banding — a closed position is done, so its row should read as a
+    # single win/loss at a glance. Open positions keep the normal banding
+    # plus per-cell highlights (entry/exit/LTP/points/profit colors).
+    closed_class = None
+    if not e['is_open']:
+        if net_profit > 0:
+            closed_class = 'row-closed-profit'
+        elif net_profit < 0:
+            closed_class = 'row-closed-loss'
+    band = closed_class or ('row-band-b' if pos_idx % 2 else 'row-band-a')
 
     rows = []
     for i, leg in enumerate(('ce', 'pe')):
         lc = leg_calc[leg]
-        ltp_style = 'background-color:#0b6623;color:#fff;font-weight:700' if lc['tgt_hit'] else ''
+        sym_extra = '' if closed_class else ' sym-cell'
+        entry_extra = '' if closed_class else ' entry-cell'
+        exit_extra = '' if closed_class else ' exit-cell'
+        ltp_style = '' if closed_class else ('background-color:#0b6623;color:#fff;font-weight:700' if lc['tgt_hit'] else '')
+        points_style = '' if closed_class else pnl_style(lc["points"])
+        profit_style = '' if closed_class else pnl_style(lc["profit"])
+        net_profit_style = '' if closed_class else pnl_style(net_profit)
         exit_disp = f"{lc['exit']:.2f}" if lc['exit'] is not None else '—'
 
         cells = []
         if i == 0:
             cells.append(f'<td rowspan="2" class="{band}">{p["sno"]}</td>')
             cells.append(f'<td rowspan="2" class="{band}">{entry_date_str}</td>')
-            cells.append(f'<td rowspan="2" class="{band} sym-cell">{esc(p["symbol"])}</td>')
+            cells.append(f'<td rowspan="2" class="{band}{sym_extra}">{esc(p["symbol"])}</td>')
             cells.append(f'<td rowspan="2" class="{band}">{lot}</td>')
         if not lc.get('taken', True):
             cells.append(
@@ -690,18 +708,18 @@ for pos_idx, e in enumerate(initial_order):
         else:
             cells.append(f'<td class="{band}">{lc["strike"]:.0f} {leg.upper()}</td>')
             cells.append(f'<td class="{band}">{lc["qty"]}</td>')
-            cells.append(f'<td class="{band} entry-cell">{lc["entry"]:.2f}</td>')
+            cells.append(f'<td class="{band}{entry_extra}">{lc["entry"]:.2f}</td>')
             cells.append(f'<td class="{band}" style="{ltp_style}">{lc["ltp"]:.2f}</td>')
             cells.append(f'<td class="{band}">{lc["tgt"]:.2f}</td>')
-            cells.append(f'<td class="{band} exit-cell">{exit_disp}</td>')
-            cells.append(f'<td class="{band}" style="{pnl_style(lc["points"])}">{lc["points"]:.2f}</td>')
+            cells.append(f'<td class="{band}{exit_extra}">{exit_disp}</td>')
+            cells.append(f'<td class="{band}" style="{points_style}">{lc["points"]:.2f}</td>')
             cells.append(f'<td class="{band}">{lc["invest"]:,.0f}</td>')
-            cells.append(f'<td class="{band}" style="{pnl_style(lc["profit"])}">{lc["profit"]:,.0f}</td>')
+            cells.append(f'<td class="{band}" style="{profit_style}">{lc["profit"]:,.0f}</td>')
         if i == 0:
-            cells.append(f'<td rowspan="2" class="{band}" style="{pnl_style(net_profit)}">{net_invest:,.0f}</td>')
-            cells.append(f'<td rowspan="2" class="{band}" style="{pnl_style(net_profit)}">{net_profit:,.0f}</td>')
-            cells.append(f'<td rowspan="2" class="{band}" style="{pnl_style(net_profit)}">{net_pct:.1f}%</td>')
-            cells.append(f'<td rowspan="2" class="{band}" style="{pnl_style(net_tgt_profit)}">{tgt_pct:.1f}%</td>')
+            cells.append(f'<td rowspan="2" class="{band}">{net_invest:,.0f}</td>')
+            cells.append(f'<td rowspan="2" class="{band}" style="{net_profit_style}">{net_profit:,.0f}</td>')
+            cells.append(f'<td rowspan="2" class="{band}" style="{net_profit_style}">{net_pct:.1f}%</td>')
+            cells.append(f'<td rowspan="2" class="{band}">{tgt_pct:.1f}%</td>')
             cells.append(f'<td rowspan="2" class="{band}">{exit_date_str}</td>')
             cells.append(f'<td rowspan="2" class="{band}">{esc(p.get("remarks") or "")}</td>')
         rows.append('<tr>' + ''.join(cells) + '</tr>')
@@ -735,7 +753,8 @@ st.caption(f"Last Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
 st.caption(
     "Click any column header to sort by it (click again to reverse). Open positions always stay "
     "above closed ones. Leg columns (Strike/Qty/entry/LTP/TGT/exit/points/invest/profit) sort by "
-    "the CE leg's value. TGT % is the profit% you'd land on if every taken leg's target were hit."
+    "the CE leg's value. TGT % is the profit% you'd land on if every taken leg's target were hit. "
+    "A closed position's whole row turns green (profit) or red (loss)."
 )
 
 table_page_html = f"""
@@ -757,6 +776,8 @@ table_page_html = f"""
     table.pnl-table thead th:hover {{ background-color: #f0954a; }}
     table.pnl-table .row-band-a {{ background-color: #ffffff; }}
     table.pnl-table .row-band-b {{ background-color: #f7f9fb; }}
+    table.pnl-table .row-closed-profit {{ background-color: #d4edda; }}
+    table.pnl-table .row-closed-loss {{ background-color: #f8d7da; }}
     table.pnl-table .sym-cell {{ background-color: #dbeeff !important; font-weight: 700; color: #0b3d91; }}
     table.pnl-table .entry-cell {{ background-color: #c6efce; font-weight: 600; }}
     table.pnl-table .exit-cell {{ background-color: #ffeb9c; font-weight: 600; }}
