@@ -3,7 +3,6 @@ import streamlit.components.v1 as components
 import pandas as pd
 import requests
 import os
-import re
 import json
 import time
 import gzip
@@ -11,28 +10,12 @@ import shutil
 import concurrent.futures
 import html as html_lib
 import io
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
-# ============================================================
-# IST helpers
-# ============================================================
-IST_OFFSET = timedelta(hours=5, minutes=30)
-IST = timezone(IST_OFFSET)
-
-
-def get_ist_now():
-    return datetime.now(IST)
-
-
-st.set_page_config(page_title="Hedge PNL Tracker", layout="wide")
-
-st.markdown("""
-    <style>
-        .block-container { padding-top: 1rem !important; padding-bottom: 1rem !important; }
-        h1 { font-size: 1.8rem !important; margin-bottom: 0.3rem !important; }
-        div[data-testid="stDataFrame"] { font-weight: 600 !important; }
-    </style>
-""", unsafe_allow_html=True)
+from storage import (
+    get_ist_now, DATA_DIR, PERSISTENCE_CONFIGURED,
+    load_positions, save_positions, next_sno, esc, pnl_style,
+)
 
 # ============================================================
 # SIMPLE BY DESIGN
@@ -43,45 +26,26 @@ st.markdown("""
 # rows and date/number columns). Instead: fill a form to open a position,
 # fill a small form to close it. Plain widgets, no fragile grid.
 #
-# PERSISTENCE
-# Streamlit Community Cloud containers are EPHEMERAL. Anything written
-# only to local disk (this app's old behaviour) is wiped the moment the
-# container restarts — which happens on redeploy, on waking from sleep
-# after inactivity, or on the platform recycling the instance. That is
-# almost certainly why positions vanished with no Clear/Delete click.
-#
-# Fix: positions are now mirrored to a private GitHub Gist (a tiny free
-# JSON store outside the container) whenever GITHUB_TOKEN + GIST_ID are
-# set in Streamlit secrets. The local file is kept too, purely as a fast
-# read cache — the Gist is the source of truth. Without those two
-# secrets configured, the app still runs exactly as before (local file
-# only) but shows a loud warning, because that mode WILL lose data again
-# on the next container restart.
-#
-# Setup (one-time, ~2 minutes):
-#   1. github.com/settings/tokens -> Generate new token (classic) -> only
-#      the "gist" scope -> copy it.
-#   2. gist.github.com -> New secret gist -> filename "hedge_positions.json"
-#      -> content "[]" -> Create secret gist -> copy the gist ID from its URL.
-#   3. In your Streamlit Cloud app -> Settings -> Secrets, add:
-#        GITHUB_TOKEN = "ghp_xxx..."
-#        GIST_ID = "the id from step 2"
-#   4. Reboot the app once from Streamlit Cloud's menu.
+# This is Page 1 of a 2-page app. Page 2 ("Calculator" in the sidebar
+# nav, pages/1_Calculator.py) is a fully separate, fully manual what-if
+# calculator — no live positions, no API — for checking risk:reward
+# before you actually place a trade. Persistence (GitHub Gist) setup
+# instructions live in storage.py.
 # ============================================================
-DATA_DIR = 'data'
-if not os.path.exists(DATA_DIR):
-    os.makedirs(DATA_DIR)
+st.set_page_config(page_title="Hedge PNL Tracker", page_icon="📈", layout="wide")
+
+st.markdown("""
+    <style>
+        .block-container { padding-top: 1rem !important; padding-bottom: 1rem !important; }
+        h1 { font-size: 1.8rem !important; margin-bottom: 0.3rem !important; }
+        div[data-testid="stDataFrame"] { font-weight: 600 !important; }
+    </style>
+""", unsafe_allow_html=True)
 
 TOKEN_FILE = os.path.join(DATA_DIR, 'token.json')
 LTP_CACHE_FILE = os.path.join(DATA_DIR, 'ltp_cache.json')
-POSITIONS_FILE = os.path.join(DATA_DIR, 'hedge_positions.json')
 TELEGRAM_CONFIG_FILE = os.path.join(DATA_DIR, 'telegram_config.json')
 NSE_JSON_PATH = 'NSE.json'
-
-GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN", "") if hasattr(st, "secrets") else ""
-GIST_ID = st.secrets.get("GIST_ID", "") if hasattr(st, "secrets") else ""
-GIST_FILENAME = "hedge_positions.json"
-PERSISTENCE_CONFIGURED = bool(GITHUB_TOKEN and GIST_ID)
 
 
 # ============================================================
@@ -254,95 +218,6 @@ def resolve_current_contract(symbol, strike, option_type, today_str):
 
 
 # ============================================================
-# Durable storage — GitHub Gist (source of truth when configured)
-# ============================================================
-def _gist_headers():
-    return {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json",
-    }
-
-
-def gist_load_positions():
-    """Returns a list from the gist, or None if the gist isn't configured
-    or couldn't be reached (caller should fall back to local file)."""
-    if not PERSISTENCE_CONFIGURED:
-        return None
-    try:
-        r = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=_gist_headers(), timeout=10)
-        if r.status_code != 200:
-            st.sidebar.error(f"Gist load failed: HTTP {r.status_code}")
-            return None
-        files = r.json().get("files", {})
-        f = files.get(GIST_FILENAME)
-        if not f:
-            return []
-        content = f.get("content", "") or ""
-        if f.get("truncated"):
-            raw = requests.get(f["raw_url"], headers=_gist_headers(), timeout=10)
-            content = raw.text
-        return json.loads(content) if content.strip() else []
-    except Exception as e:
-        st.sidebar.error(f"Gist load failed: {e}")
-        return None
-
-
-def gist_save_positions(positions):
-    if not PERSISTENCE_CONFIGURED:
-        return False
-    try:
-        payload = {"files": {GIST_FILENAME: {"content": json.dumps(positions, indent=2, default=str)}}}
-        r = requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=_gist_headers(), json=payload, timeout=10)
-        if r.status_code != 200:
-            st.sidebar.error(f"Gist save failed: HTTP {r.status_code}: {r.text[:200]}")
-            return False
-        return True
-    except Exception as e:
-        st.sidebar.error(f"Gist save failed: {e}")
-        return False
-
-
-# ============================================================
-# Position storage — a plain list of dicts, one per hedge (CE+PE legs
-# baked in together). No dataframe editing involved anywhere, so none of
-# the data_editor dtype/row fragility applies here.
-# ============================================================
-def load_positions():
-    remote = gist_load_positions()
-    if remote is not None:
-        try:
-            with open(POSITIONS_FILE, 'w') as f:
-                json.dump(remote, f, indent=2, default=str)
-        except Exception:
-            pass
-        return remote
-    if os.path.exists(POSITIONS_FILE):
-        try:
-            with open(POSITIONS_FILE, 'r') as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return []
-
-
-def save_positions(positions):
-    try:
-        with open(POSITIONS_FILE, 'w') as f:
-            json.dump(positions, f, indent=2, default=str)
-    except Exception as e:
-        st.error(f"Could not save positions locally: {e}")
-    if PERSISTENCE_CONFIGURED:
-        if not gist_save_positions(positions):
-            st.sidebar.error("⚠️ Could not reach GitHub Gist backup just now — saved locally only for this session.")
-
-
-def next_sno(positions):
-    if not positions:
-        return 1
-    return max(p.get('sno', 0) for p in positions) + 1
-
-
-# ============================================================
 # Sidebar
 # ============================================================
 with st.sidebar:
@@ -353,7 +228,7 @@ with st.sidebar:
             "the app restarts (redeploy, sleep/wake, or platform recycle) — "
             "this is what wiped your positions before. Add GITHUB_TOKEN and "
             "GIST_ID under Settings → Secrets to fix this permanently. "
-            "See the comment block at the top of this file for the 2-minute setup."
+            "See the comment block at the top of storage.py for the 2-minute setup."
         )
     else:
         st.success("✅ Durable storage active (GitHub Gist). Positions survive app restarts.")
@@ -436,7 +311,7 @@ with st.sidebar:
 # Main page
 # ============================================================
 st.title("Hedge PNL Tracker")
-st.caption("Every position = one symbol, one CE leg, one PE leg. LTP is the only thing pulled from the API automatically.")
+st.caption("Every position = one symbol, one CE leg, one PE leg. LTP is the only thing pulled from the API automatically. Need to plan a trade before entering it? Use **Calculator** in the sidebar.")
 
 positions = load_positions()
 
@@ -558,21 +433,14 @@ def leg_ltp(inst_key):
 # ------------------------------------------------------------
 # Build the display table — spreadsheet-style: one row PER LEG (CE, PE)
 # like the original Excel sheet, with the shared fields (S.no, Entry
-# Date, Symbol, lot Size, Net Invest, Net Profit, profit%, Exit Date,
-# Remarks) merged (rowspan) across the two leg rows instead of repeated.
+# Date, Symbol, lot Size, Net Invest, Net Profit, profit%, TGT %, Exit
+# Date, Remarks) merged (rowspan) across the two leg rows instead of
+# repeated.
+#
+# TGT % is a what-if column: the overall profit% you'd land on if every
+# taken leg's TGT were hit exactly, instead of today's LTP/actual exit —
+# a quick "how good is my target really" check next to the real profit%.
 # ------------------------------------------------------------
-def esc(v):
-    return html_lib.escape(str(v))
-
-
-def pnl_style(val):
-    if val > 0:
-        return 'background-color:#d4edda;color:#155724;font-weight:700'
-    if val < 0:
-        return 'background-color:#f8d7da;color:#721c24;font-weight:700'
-    return ''
-
-
 open_legs = 0
 total_invest = 0.0
 total_profit = 0.0
@@ -594,6 +462,7 @@ for p in positions:
                 'strike': p.get(f'{leg}_strike') or 0, 'qty': int(p.get(f'{leg}_qty') or 0),
                 'entry': 0.0, 'ltp': 0.0, 'tgt': 0.0, 'exit': None,
                 'points': 0.0, 'invest': 0.0, 'profit': 0.0,
+                'tgt_profit': 0.0,
                 'is_open': False, 'tgt_hit': False, 'taken': False,
             }
             continue
@@ -607,10 +476,13 @@ for p in positions:
         points = (effective_exit - entry) * qty
         invest = entry * lot * qty
         profit = points * lot
+        # What-if: profit this leg would show if TGT is hit exactly.
+        # Only meaningful when a TGT price has actually been set.
+        tgt_profit = ((tgt - entry) * qty * lot) if tgt > 0 else 0.0
         leg_calc[leg] = {
             'strike': p[f'{leg}_strike'], 'qty': qty, 'entry': entry, 'ltp': ltp,
             'tgt': tgt, 'exit': exit_, 'points': points, 'invest': invest,
-            'profit': profit, 'is_open': is_open,
+            'profit': profit, 'tgt_profit': tgt_profit, 'is_open': is_open,
             'tgt_hit': tgt > 0 and is_open and ltp >= tgt, 'taken': True,
         }
 
@@ -619,6 +491,8 @@ for p in positions:
     if net_profit == 0:
         net_profit = 0.0  # avoid displaying "-0"
     net_pct = (net_profit / net_invest * 100) if net_invest else 0.0
+    net_tgt_profit = leg_calc['ce']['tgt_profit'] + leg_calc['pe']['tgt_profit']
+    tgt_pct = (net_tgt_profit / net_invest * 100) if net_invest else 0.0
     pos_open_legs = int(leg_calc['ce']['is_open']) + int(leg_calc['pe']['is_open'])
 
     open_legs += pos_open_legs
@@ -674,6 +548,7 @@ for p in positions:
     enriched.append({
         'p': p, 'leg_calc': leg_calc,
         'net_invest': net_invest, 'net_profit': net_profit, 'net_pct': net_pct,
+        'net_tgt_profit': net_tgt_profit, 'tgt_pct': tgt_pct,
         'is_open': pos_open_legs > 0,
         'entry_date_str': entry_date_str, 'exit_date_str': exit_date_str,
         'entry_date_sort': entry_date_parsed, 'exit_date_sort': exit_date_parsed,
@@ -705,7 +580,7 @@ m4.metric("Overall PNL %", f"{overall_pct:.1f}%")
 # those headers sorts by the CE leg's value; there's a tooltip on those
 # headers saying so.
 # ------------------------------------------------------------
-def _leg_row_dict(p, lot, leg, lc, entry_date_str, exit_date_str, net_invest, net_profit, net_pct):
+def _leg_row_dict(p, lot, leg, lc, entry_date_str, exit_date_str, net_invest, net_profit, net_pct, tgt_pct):
     if not lc.get('taken', True):
         return {
             'S.no': p['sno'], 'Entry Date': entry_date_str, 'SYMBOL': p['symbol'], 'lot Size': lot,
@@ -713,7 +588,7 @@ def _leg_row_dict(p, lot, leg, lc, entry_date_str, exit_date_str, net_invest, ne
             'entry': '—', 'LTP': '—', 'TGT': '—', 'exit': '—',
             'points': '—', 'invest': '—', 'profit': '—',
             'Net Invest': round(net_invest, 2), 'Net Profit': round(net_profit, 2),
-            'profit%': round(net_pct, 2), 'Exit Date': exit_date_str,
+            'profit%': round(net_pct, 2), 'TGT %': round(tgt_pct, 2), 'Exit Date': exit_date_str,
             'remarks': p.get('remarks') or '',
         }
     exit_disp = f"{lc['exit']:.2f}" if lc['exit'] is not None else '—'
@@ -724,7 +599,7 @@ def _leg_row_dict(p, lot, leg, lc, entry_date_str, exit_date_str, net_invest, ne
         'points': round(lc['points'], 2), 'invest': round(lc['invest'], 2),
         'profit': round(lc['profit'], 2),
         'Net Invest': round(net_invest, 2), 'Net Profit': round(net_profit, 2),
-        'profit%': round(net_pct, 2), 'Exit Date': exit_date_str,
+        'profit%': round(net_pct, 2), 'TGT %': round(tgt_pct, 2), 'Exit Date': exit_date_str,
         'remarks': p.get('remarks') or '',
     }
 
@@ -750,6 +625,7 @@ TABLE_COLUMNS = [
     ("Net Invest", "net_invest", None),
     ("Net Profit", "net_profit", None),
     ("profit%", "net_pct", None),
+    ("TGT %", "tgt_pct", "Profit % you'd land on if every taken leg's TGT is hit exactly"),
     ("Exit Date", "exit_date", None),
     ("remarks", "remarks", None),
 ]
@@ -765,6 +641,7 @@ body_blocks_html = []
 for pos_idx, e in enumerate(initial_order):
     p, leg_calc = e['p'], e['leg_calc']
     net_invest, net_profit, net_pct = e['net_invest'], e['net_profit'], e['net_pct']
+    net_tgt_profit, tgt_pct = e['net_tgt_profit'], e['tgt_pct']
     entry_date_str, exit_date_str = e['entry_date_str'], e['exit_date_str']
     lot = p.get('lot_size') or 0
     ce = leg_calc['ce']
@@ -777,6 +654,7 @@ for pos_idx, e in enumerate(initial_order):
         'net_invest': round(net_invest, 2),
         'net_profit': round(net_profit, 2),
         'net_pct': round(net_pct, 2),
+        'tgt_pct': round(tgt_pct, 2),
         'exit_date': _ts_ms(e['exit_date_sort']),
         'remarks': p.get('remarks') or '',
         'ce_strike': ce['strike'],
@@ -823,6 +701,7 @@ for pos_idx, e in enumerate(initial_order):
             cells.append(f'<td rowspan="2" class="{band}" style="{pnl_style(net_profit)}">{net_invest:,.0f}</td>')
             cells.append(f'<td rowspan="2" class="{band}" style="{pnl_style(net_profit)}">{net_profit:,.0f}</td>')
             cells.append(f'<td rowspan="2" class="{band}" style="{pnl_style(net_profit)}">{net_pct:.1f}%</td>')
+            cells.append(f'<td rowspan="2" class="{band}" style="{pnl_style(net_tgt_profit)}">{tgt_pct:.1f}%</td>')
             cells.append(f'<td rowspan="2" class="{band}">{exit_date_str}</td>')
             cells.append(f'<td rowspan="2" class="{band}">{esc(p.get("remarks") or "")}</td>')
         rows.append('<tr>' + ''.join(cells) + '</tr>')
@@ -849,14 +728,14 @@ for e in initial_order:
     for leg in ('ce', 'pe'):
         export_rows.append(_leg_row_dict(
             p, lot, leg, leg_calc[leg], e['entry_date_str'], e['exit_date_str'],
-            e['net_invest'], e['net_profit'], e['net_pct']
+            e['net_invest'], e['net_profit'], e['net_pct'], e['tgt_pct']
         ))
 
 st.caption(f"Last Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
 st.caption(
     "Click any column header to sort by it (click again to reverse). Open positions always stay "
     "above closed ones. Leg columns (Strike/Qty/entry/LTP/TGT/exit/points/invest/profit) sort by "
-    "the CE leg's value."
+    "the CE leg's value. TGT % is the profit% you'd land on if every taken leg's target were hit."
 )
 
 table_page_html = f"""
@@ -1019,6 +898,17 @@ with st.expander("✏️ Close / Edit a Position", expanded=False):
             value=int(pos.get('pe_qty') or 1)
         )
 
+        st.caption("TGT")
+        t1, t2 = st.columns(2)
+        ce_tgt_val = t1.number_input(
+            "CE TGT", min_value=0.0, step=0.05, format="%.2f",
+            value=float(pos.get('ce_tgt') or 0.0)
+        )
+        pe_tgt_val = t2.number_input(
+            "PE TGT", min_value=0.0, step=0.05, format="%.2f",
+            value=float(pos.get('pe_tgt') or 0.0)
+        )
+
         st.caption("Exit")
         c1, c2 = st.columns(2)
         ce_exit_val = c1.number_input(
@@ -1050,6 +940,8 @@ with st.expander("✏️ Close / Edit a Position", expanded=False):
             pos['pe_entry'] = pe_entry_val
             pos['ce_qty'] = int(ce_qty_val)
             pos['pe_qty'] = int(pe_qty_val)
+            pos['ce_tgt'] = ce_tgt_val
+            pos['pe_tgt'] = pe_tgt_val
             pos['ce_exit'] = ce_exit_val if ce_exit_val > 0 else None
             pos['pe_exit'] = pe_exit_val if pe_exit_val > 0 else None
             pos['exit_date'] = str(exit_date_val) if (ce_exit_val > 0 or pe_exit_val > 0) else None
