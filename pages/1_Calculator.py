@@ -1,3 +1,5 @@
+import time
+
 import streamlit as st
 
 from storage import (
@@ -195,6 +197,15 @@ if decision_rows:
     """
     st.markdown(decision_table_html, unsafe_allow_html=True)
 
+    with st.popover("🗑️ Clear All Decision Rows", use_container_width=False):
+        st.warning("This deletes every decision row permanently. This cannot be undone.")
+        confirm_clear_d = st.checkbox("Yes, I'm sure — clear everything", key="confirm_clear_decision")
+        if st.button("Confirm Clear All", disabled=not confirm_clear_d, use_container_width=True, key="confirm_clear_decision_btn"):
+            save_decision_rows([])
+            st.success("Cleared.")
+            time.sleep(1)
+            st.rerun()
+
     with st.expander("✏️ Edit / Delete Decision Row", expanded=False):
         d_options = {f"{r['symbol']} (row {r['id']})": r['id'] for r in decision_rows}
         d_choice = st.selectbox("Row", options=list(d_options.keys()), key="d_edit_choice")
@@ -202,23 +213,23 @@ if decision_rows:
         drow = next(r for r in decision_rows if r['id'] == d_sel_id)
 
         with st.form("edit_decision_form"):
-            e_lot = st.number_input("lot Size", min_value=0, step=1, value=int(drow.get('lot_size') or 0))
+            e_lot = st.number_input("lot Size", min_value=0, step=1, value=int(drow.get('lot_size') or 0), key="e_lot")
 
             st.markdown("**CE leg**")
             ece1, ece2, ece3, ece4, ece5 = st.columns(5)
-            e_ce_entry_strike = ece1.number_input("Entry Strike", min_value=0.0, step=0.5, format="%.1f", value=float(drow.get('ce_entry_strike') or 0.0))
-            e_ce_entry_price = ece2.number_input("Entry Price", min_value=0.0, step=0.05, format="%.2f", value=float(drow.get('ce_entry_price') or 0.0))
-            e_ce_tgt_strike = ece3.number_input("TGT Strike", min_value=0.0, step=0.5, format="%.1f", value=float(drow.get('ce_tgt_strike') or 0.0))
-            e_ce_tgt_price = ece4.number_input("TGT Price", min_value=0.0, step=0.05, format="%.2f", value=float(drow.get('ce_tgt_price') or 0.0))
-            e_ce_qty = ece5.number_input("Qty", min_value=1, step=1, value=int(drow.get('ce_qty') or 1))
+            e_ce_entry_strike = ece1.number_input("Entry Strike", min_value=0.0, step=0.5, format="%.1f", value=float(drow.get('ce_entry_strike') or 0.0), key="e_ce_entry_strike")
+            e_ce_entry_price = ece2.number_input("Entry Price", min_value=0.0, step=0.05, format="%.2f", value=float(drow.get('ce_entry_price') or 0.0), key="e_ce_entry_price")
+            e_ce_tgt_strike = ece3.number_input("TGT Strike", min_value=0.0, step=0.5, format="%.1f", value=float(drow.get('ce_tgt_strike') or 0.0), key="e_ce_tgt_strike")
+            e_ce_tgt_price = ece4.number_input("TGT Price", min_value=0.0, step=0.05, format="%.2f", value=float(drow.get('ce_tgt_price') or 0.0), key="e_ce_tgt_price")
+            e_ce_qty = ece5.number_input("Qty", min_value=1, step=1, value=int(drow.get('ce_qty') or 1), key="e_ce_qty")
 
             st.markdown("**PE leg**")
             epe1, epe2, epe3, epe4, epe5 = st.columns(5)
-            e_pe_entry_strike = epe1.number_input("Entry Strike", min_value=0.0, step=0.5, format="%.1f", value=float(drow.get('pe_entry_strike') or 0.0))
-            e_pe_entry_price = epe2.number_input("Entry Price", min_value=0.0, step=0.05, format="%.2f", value=float(drow.get('pe_entry_price') or 0.0))
-            e_pe_tgt_strike = epe3.number_input("TGT Strike", min_value=0.0, step=0.5, format="%.1f", value=float(drow.get('pe_tgt_strike') or 0.0))
-            e_pe_tgt_price = epe4.number_input("TGT Price", min_value=0.0, step=0.05, format="%.2f", value=float(drow.get('pe_tgt_price') or 0.0))
-            e_pe_qty = epe5.number_input("Qty", min_value=1, step=1, value=int(drow.get('pe_qty') or 1))
+            e_pe_entry_strike = epe1.number_input("Entry Strike", min_value=0.0, step=0.5, format="%.1f", value=float(drow.get('pe_entry_strike') or 0.0), key="e_pe_entry_strike")
+            e_pe_entry_price = epe2.number_input("Entry Price", min_value=0.0, step=0.05, format="%.2f", value=float(drow.get('pe_entry_price') or 0.0), key="e_pe_entry_price")
+            e_pe_tgt_strike = epe3.number_input("TGT Strike", min_value=0.0, step=0.5, format="%.1f", value=float(drow.get('pe_tgt_strike') or 0.0), key="e_pe_tgt_strike")
+            e_pe_tgt_price = epe4.number_input("TGT Price", min_value=0.0, step=0.05, format="%.2f", value=float(drow.get('pe_tgt_price') or 0.0), key="e_pe_tgt_price")
+            e_pe_qty = epe5.number_input("Qty", min_value=1, step=1, value=int(drow.get('pe_qty') or 1), key="e_pe_qty")
 
             d_save_col, d_delete_col = st.columns(2)
             d_save_clicked = d_save_col.form_submit_button("💾 Save", use_container_width=True)
