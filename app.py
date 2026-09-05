@@ -985,6 +985,21 @@ with st.expander("✏️ Close / Edit a Position", expanded=False):
     pos = next(p for p in positions if p['sno'] == sel_sno)
 
     with st.form("edit_position_form"):
+        st.caption("Entry Date & Strikes — fix these here if they were entered wrong")
+        d1, d2, d3 = st.columns(3)
+        entry_date_edit_val = d1.date_input(
+            "Entry Date",
+            value=pd.to_datetime(pos.get('entry_date')).date() if pos.get('entry_date') else get_ist_now().date()
+        )
+        ce_strike_val = d2.number_input(
+            "CE Strike", min_value=0.0, step=0.5, format="%.1f",
+            value=float(pos.get('ce_strike') or 0.0)
+        )
+        pe_strike_val = d3.number_input(
+            "PE Strike", min_value=0.0, step=0.5, format="%.1f",
+            value=float(pos.get('pe_strike') or 0.0)
+        )
+
         st.caption("Entry / Qty")
         e1, e2, e3, e4 = st.columns(4)
         ce_entry_val = e1.number_input(
@@ -1025,6 +1040,12 @@ with st.expander("✏️ Close / Edit a Position", expanded=False):
         delete_clicked = delete_col.form_submit_button("🗑️ Delete Position", use_container_width=True)
 
         if save_clicked:
+            original_ce_strike = pos.get('ce_strike') or 0
+            original_pe_strike = pos.get('pe_strike') or 0
+
+            pos['entry_date'] = str(entry_date_edit_val)
+            pos['ce_strike'] = ce_strike_val
+            pos['pe_strike'] = pe_strike_val
             pos['ce_entry'] = ce_entry_val
             pos['pe_entry'] = pe_entry_val
             pos['ce_qty'] = int(ce_qty_val)
@@ -1033,6 +1054,31 @@ with st.expander("✏️ Close / Edit a Position", expanded=False):
             pos['pe_exit'] = pe_exit_val if pe_exit_val > 0 else None
             pos['exit_date'] = str(exit_date_val) if (ce_exit_val > 0 or pe_exit_val > 0) else None
             pos['remarks'] = remarks_val
+
+            # A corrected strike means the instrument key resolved earlier
+            # is for the WRONG contract and would keep showing that
+            # contract's LTP — re-resolve whichever leg's strike actually
+            # changed (only matters for a leg that's actually taken).
+            today_str = get_ist_now().strftime('%Y-%m-%d')
+            if pos['ce_entry'] > 0 and ce_strike_val != original_ce_strike:
+                ce_key, ce_lot, ce_expiry = resolve_current_contract(pos['symbol'], ce_strike_val, "CE", today_str)
+                pos['ce_instrument_key'] = ce_key
+                if ce_lot:
+                    pos['lot_size'] = ce_lot
+                if ce_expiry:
+                    pos['expiry'] = ce_expiry
+                if not ce_key:
+                    st.warning("Couldn't match the new CE strike to a live contract — download NSE.json first.")
+            if pos['pe_entry'] > 0 and pe_strike_val != original_pe_strike:
+                pe_key, pe_lot, pe_expiry = resolve_current_contract(pos['symbol'], pe_strike_val, "PE", today_str)
+                pos['pe_instrument_key'] = pe_key
+                if pe_lot and not pos.get('lot_size'):
+                    pos['lot_size'] = pe_lot
+                if pe_expiry and not pos.get('expiry'):
+                    pos['expiry'] = pe_expiry
+                if not pe_key:
+                    st.warning("Couldn't match the new PE strike to a live contract — download NSE.json first.")
+
             # Numbers changed — let TGT/profit% alerts re-evaluate from scratch.
             for flag in ('ce_tgt_alerted', 'pe_tgt_alerted', 'profit50_alerted', 'loss30_alerted'):
                 pos.pop(flag, None)
