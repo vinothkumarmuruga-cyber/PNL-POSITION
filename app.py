@@ -413,7 +413,7 @@ with st.sidebar:
         fixed = 0
         for p in current_positions:
             for leg in ('ce', 'pe'):
-                if not p.get(f'{leg}_instrument_key'):
+                if float(p.get(f'{leg}_entry') or 0) > 0 and not p.get(f'{leg}_instrument_key'):
                     key, lot_size, expiry_str = resolve_current_contract(
                         p['symbol'], p[f'{leg}_strike'], leg.upper(), today_str
                     )
@@ -444,6 +444,7 @@ positions = load_positions()
 # Open a new position
 # ------------------------------------------------------------
 with st.expander("➕ Add Position", expanded=(len(positions) == 0)):
+    st.caption("Only taking one side? Leave the other leg's Entry at 0 — it won't be calculated or shown as open.")
     with st.form("add_position_form", clear_on_submit=True):
         c1, c2 = st.columns(2)
         entry_date = c1.date_input("Entry Date", value=get_ist_now().date())
@@ -468,14 +469,33 @@ with st.expander("➕ Add Position", expanded=(len(positions) == 0)):
         submitted = st.form_submit_button("Add Position", use_container_width=True)
 
         if submitted:
-            if not symbol or ce_strike <= 0 or pe_strike <= 0 or ce_entry <= 0 or pe_entry <= 0:
-                st.error("Symbol, both strikes and both entry prices are required.")
+            # A leg only counts as "taken" if it has an entry price. Some
+            # hedges are CE-only or PE-only — a leg with entry left at 0 is
+            # simply not part of the position and is never calculated.
+            ce_taken = ce_entry > 0
+            pe_taken = pe_entry > 0
+            valid = (
+                bool(symbol) and (ce_taken or pe_taken)
+                and (not ce_taken or ce_strike > 0)
+                and (not pe_taken or pe_strike > 0)
+            )
+            if not valid:
+                st.error(
+                    "Symbol is required, plus at least one leg (CE or PE) with both its "
+                    "strike and entry price filled in — the other leg can be left at 0 "
+                    "if this hedge only has one side."
+                )
             else:
                 today_str = get_ist_now().strftime('%Y-%m-%d')
-                ce_key, lot_size, expiry_str = resolve_current_contract(symbol, ce_strike, "CE", today_str)
-                pe_key, pe_lot_size, _ = resolve_current_contract(symbol, pe_strike, "PE", today_str)
+                ce_key = lot_size = expiry_str = None
+                pe_key = pe_lot_size = pe_expiry_str = None
+                if ce_taken:
+                    ce_key, lot_size, expiry_str = resolve_current_contract(symbol, ce_strike, "CE", today_str)
+                if pe_taken:
+                    pe_key, pe_lot_size, pe_expiry_str = resolve_current_contract(symbol, pe_strike, "PE", today_str)
                 lot_size = lot_size or pe_lot_size
-                if not ce_key or not pe_key:
+                expiry_str = expiry_str or pe_expiry_str
+                if (ce_taken and not ce_key) or (pe_taken and not pe_key):
                     st.warning(
                         "Couldn't match one or both legs to a live contract in NSE.json "
                         "(download it in the sidebar first). Position added anyway — "
@@ -487,10 +507,16 @@ with st.expander("➕ Add Position", expanded=(len(positions) == 0)):
                     'symbol': symbol,
                     'lot_size': lot_size or 0,
                     'expiry': expiry_str,
-                    'ce_strike': ce_strike, 'ce_entry': ce_entry, 'ce_tgt': ce_tgt,
-                    'ce_qty': int(ce_qty), 'ce_exit': None, 'ce_instrument_key': ce_key,
-                    'pe_strike': pe_strike, 'pe_entry': pe_entry, 'pe_tgt': pe_tgt,
-                    'pe_qty': int(pe_qty), 'pe_exit': None, 'pe_instrument_key': pe_key,
+                    'ce_strike': ce_strike if ce_taken else 0,
+                    'ce_entry': ce_entry if ce_taken else 0,
+                    'ce_tgt': ce_tgt if ce_taken else 0,
+                    'ce_qty': int(ce_qty) if ce_taken else 0, 'ce_exit': None,
+                    'ce_instrument_key': ce_key if ce_taken else None,
+                    'pe_strike': pe_strike if pe_taken else 0,
+                    'pe_entry': pe_entry if pe_taken else 0,
+                    'pe_tgt': pe_tgt if pe_taken else 0,
+                    'pe_qty': int(pe_qty) if pe_taken else 0, 'pe_exit': None,
+                    'pe_instrument_key': pe_key if pe_taken else None,
                     'exit_date': None,
                     'remarks': remarks,
                 }
@@ -559,6 +585,18 @@ for p in positions:
     leg_calc = {}
     for leg in ('ce', 'pe'):
         entry = float(p.get(f'{leg}_entry') or 0)
+        taken = entry > 0
+        if not taken:
+            # This leg was never taken (some hedges are CE-only or
+            # PE-only) — it contributes nothing to invest/profit/points
+            # and doesn't count as an open or closed leg.
+            leg_calc[leg] = {
+                'strike': p.get(f'{leg}_strike') or 0, 'qty': int(p.get(f'{leg}_qty') or 0),
+                'entry': 0.0, 'ltp': 0.0, 'tgt': 0.0, 'exit': None,
+                'points': 0.0, 'invest': 0.0, 'profit': 0.0,
+                'is_open': False, 'tgt_hit': False, 'taken': False,
+            }
+            continue
         exit_ = p.get(f'{leg}_exit')
         exit_ = float(exit_) if exit_ not in (None, '') else None
         qty = int(p.get(f'{leg}_qty') or 0)
@@ -573,7 +611,7 @@ for p in positions:
             'strike': p[f'{leg}_strike'], 'qty': qty, 'entry': entry, 'ltp': ltp,
             'tgt': tgt, 'exit': exit_, 'points': points, 'invest': invest,
             'profit': profit, 'is_open': is_open,
-            'tgt_hit': tgt > 0 and is_open and ltp >= tgt,
+            'tgt_hit': tgt > 0 and is_open and ltp >= tgt, 'taken': True,
         }
 
     net_invest = leg_calc['ce']['invest'] + leg_calc['pe']['invest']
@@ -668,6 +706,16 @@ m4.metric("Overall PNL %", f"{overall_pct:.1f}%")
 # headers saying so.
 # ------------------------------------------------------------
 def _leg_row_dict(p, lot, leg, lc, entry_date_str, exit_date_str, net_invest, net_profit, net_pct):
+    if not lc.get('taken', True):
+        return {
+            'S.no': p['sno'], 'Entry Date': entry_date_str, 'SYMBOL': p['symbol'], 'lot Size': lot,
+            'Strike': f'{leg.upper()} not taken', 'Qty': '—',
+            'entry': '—', 'LTP': '—', 'TGT': '—', 'exit': '—',
+            'points': '—', 'invest': '—', 'profit': '—',
+            'Net Invest': round(net_invest, 2), 'Net Profit': round(net_profit, 2),
+            'profit%': round(net_pct, 2), 'Exit Date': exit_date_str,
+            'remarks': p.get('remarks') or '',
+        }
     exit_disp = f"{lc['exit']:.2f}" if lc['exit'] is not None else '—'
     return {
         'S.no': p['sno'], 'Entry Date': entry_date_str, 'SYMBOL': p['symbol'], 'lot Size': lot,
@@ -756,15 +804,21 @@ for pos_idx, e in enumerate(initial_order):
             cells.append(f'<td rowspan="2" class="{band}">{entry_date_str}</td>')
             cells.append(f'<td rowspan="2" class="{band} sym-cell">{esc(p["symbol"])}</td>')
             cells.append(f'<td rowspan="2" class="{band}">{lot}</td>')
-        cells.append(f'<td class="{band}">{lc["strike"]:.0f} {leg.upper()}</td>')
-        cells.append(f'<td class="{band}">{lc["qty"]}</td>')
-        cells.append(f'<td class="{band} entry-cell">{lc["entry"]:.2f}</td>')
-        cells.append(f'<td class="{band}" style="{ltp_style}">{lc["ltp"]:.2f}</td>')
-        cells.append(f'<td class="{band}">{lc["tgt"]:.2f}</td>')
-        cells.append(f'<td class="{band} exit-cell">{exit_disp}</td>')
-        cells.append(f'<td class="{band}" style="{pnl_style(lc["points"])}">{lc["points"]:.2f}</td>')
-        cells.append(f'<td class="{band}">{lc["invest"]:,.0f}</td>')
-        cells.append(f'<td class="{band}" style="{pnl_style(lc["profit"])}">{lc["profit"]:,.0f}</td>')
+        if not lc.get('taken', True):
+            cells.append(
+                f'<td class="{band}" colspan="9" style="color:#888;font-style:italic;background:#f2f2f2;">'
+                f'{leg.upper()} leg not taken</td>'
+            )
+        else:
+            cells.append(f'<td class="{band}">{lc["strike"]:.0f} {leg.upper()}</td>')
+            cells.append(f'<td class="{band}">{lc["qty"]}</td>')
+            cells.append(f'<td class="{band} entry-cell">{lc["entry"]:.2f}</td>')
+            cells.append(f'<td class="{band}" style="{ltp_style}">{lc["ltp"]:.2f}</td>')
+            cells.append(f'<td class="{band}">{lc["tgt"]:.2f}</td>')
+            cells.append(f'<td class="{band} exit-cell">{exit_disp}</td>')
+            cells.append(f'<td class="{band}" style="{pnl_style(lc["points"])}">{lc["points"]:.2f}</td>')
+            cells.append(f'<td class="{band}">{lc["invest"]:,.0f}</td>')
+            cells.append(f'<td class="{band}" style="{pnl_style(lc["profit"])}">{lc["profit"]:,.0f}</td>')
         if i == 0:
             cells.append(f'<td rowspan="2" class="{band}" style="{pnl_style(net_profit)}">{net_invest:,.0f}</td>')
             cells.append(f'<td rowspan="2" class="{band}" style="{pnl_style(net_profit)}">{net_profit:,.0f}</td>')
