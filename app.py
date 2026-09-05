@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import requests
 import os
@@ -654,52 +655,18 @@ m3.metric("Total Net Profit", f"₹{total_profit:,.0f}")
 m4.metric("Overall PNL %", f"{overall_pct:.1f}%")
 
 # ------------------------------------------------------------
-# Search + sort — open positions always pinned above closed ones.
-# Metrics above stay computed on ALL positions; only the table below
-# reacts to search/sort.
+# Interactive table — every column header is clickable to sort (click
+# again to reverse), plus an instant search box. Both run entirely in
+# the browser (no server round-trip), and open positions are ALWAYS
+# kept above closed ones no matter which column is sorted or in what
+# direction — that grouping is enforced first, the clicked column only
+# orders within each group.
+#
+# Leg-specific columns (Strike/Qty/entry/LTP/TGT/exit/points/invest/
+# profit) show two values per position (CE and PE) — clicking one of
+# those headers sorts by the CE leg's value; there's a tooltip on those
+# headers saying so.
 # ------------------------------------------------------------
-sc1, sc2, sc3 = st.columns([2, 2, 1])
-search_term = sc1.text_input("🔍 Search (S.no, symbol or remarks)", value="", placeholder="e.g. KOTAKBANK")
-sort_field = sc2.selectbox(
-    "Sort by",
-    ["S.no", "Symbol", "Entry Date", "Exit Date", "Net Invest", "Net Profit", "PNL %"],
-)
-sort_desc = sc3.checkbox("Descending", value=(sort_field in ("Net Profit", "PNL %")))
-
-_min_ts = pd.Timestamp.min
-SORT_KEYS = {
-    "S.no": lambda e: e['p']['sno'],
-    "Symbol": lambda e: e['p']['symbol'],
-    "Entry Date": lambda e: e['entry_date_sort'] if pd.notna(e['entry_date_sort']) else _min_ts,
-    "Exit Date": lambda e: e['exit_date_sort'] if pd.notna(e['exit_date_sort']) else _min_ts,
-    "Net Invest": lambda e: e['net_invest'],
-    "Net Profit": lambda e: e['net_profit'],
-    "PNL %": lambda e: e['net_pct'],
-}
-sort_key = SORT_KEYS[sort_field]
-
-term = search_term.strip().upper()
-if term:
-    filtered = [
-        e for e in enriched
-        if term in e['p']['symbol'].upper()
-        or term in (e['p'].get('remarks') or '').upper()
-        or term == str(e['p']['sno'])
-    ]
-else:
-    filtered = enriched
-
-# Open positions always float to the top, regardless of the chosen sort —
-# each group (open, then closed) is independently sorted by that field.
-open_group = sorted((e for e in filtered if e['is_open']), key=sort_key, reverse=sort_desc)
-closed_group = sorted((e for e in filtered if not e['is_open']), key=sort_key, reverse=sort_desc)
-display_list = open_group + closed_group
-
-if term and not display_list:
-    st.info(f"No positions match '{search_term}'.")
-elif term:
-    st.caption(f"Showing {len(display_list)} of {len(enriched)} positions. Excel download below always includes all of them, regardless of this search.")
-
 def _leg_row_dict(p, lot, leg, lc, entry_date_str, exit_date_str, net_invest, net_profit, net_pct):
     exit_disp = f"{lc['exit']:.2f}" if lc['exit'] is not None else '—'
     return {
@@ -713,16 +680,71 @@ def _leg_row_dict(p, lot, leg, lc, entry_date_str, exit_date_str, net_invest, ne
         'remarks': p.get('remarks') or '',
     }
 
-# Table shown on screen — respects search + sort, open positions pinned first.
-body_rows_html = []
-for pos_idx, e in enumerate(display_list):
+
+def _ts_ms(ts):
+    return int(ts.timestamp() * 1000) if pd.notna(ts) else None
+
+
+TABLE_COLUMNS = [
+    ("S.no", "sno", None),
+    ("Entry Date", "entry_date", None),
+    ("SYMBOL", "symbol", None),
+    ("lot Size", "lot_size", None),
+    ("Strike", "ce_strike", "Sorts by the CE leg's value"),
+    ("Qty", "ce_qty", "Sorts by the CE leg's value"),
+    ("entry", "ce_entry", "Sorts by the CE leg's value"),
+    ("LTP", "ce_ltp", "Sorts by the CE leg's value"),
+    ("TGT", "ce_tgt", "Sorts by the CE leg's value"),
+    ("exit", "ce_exit", "Sorts by the CE leg's value"),
+    ("points", "ce_points", "Sorts by the CE leg's value"),
+    ("invest", "ce_invest", "Sorts by the CE leg's value"),
+    ("profit", "ce_profit", "Sorts by the CE leg's value"),
+    ("Net Invest", "net_invest", None),
+    ("Net Profit", "net_profit", None),
+    ("profit%", "net_pct", None),
+    ("Exit Date", "exit_date", None),
+    ("remarks", "remarks", None),
+]
+
+# Fixed initial order in the DOM: open positions first (by S.no), then
+# closed (by S.no). The script re-sorts client-side from here, but always
+# re-applies this same open-before-closed grouping after every click.
+initial_open = sorted((e for e in enriched if e['is_open']), key=lambda e: e['p']['sno'])
+initial_closed = sorted((e for e in enriched if not e['is_open']), key=lambda e: e['p']['sno'])
+initial_order = initial_open + initial_closed
+
+body_blocks_html = []
+for pos_idx, e in enumerate(initial_order):
     p, leg_calc = e['p'], e['leg_calc']
     net_invest, net_profit, net_pct = e['net_invest'], e['net_profit'], e['net_pct']
     entry_date_str, exit_date_str = e['entry_date_str'], e['exit_date_str']
     lot = p.get('lot_size') or 0
+    ce = leg_calc['ce']
 
+    sort_vals = {
+        'sno': p['sno'],
+        'entry_date': _ts_ms(e['entry_date_sort']),
+        'symbol': p['symbol'],
+        'lot_size': lot,
+        'net_invest': round(net_invest, 2),
+        'net_profit': round(net_profit, 2),
+        'net_pct': round(net_pct, 2),
+        'exit_date': _ts_ms(e['exit_date_sort']),
+        'remarks': p.get('remarks') or '',
+        'ce_strike': ce['strike'],
+        'ce_qty': ce['qty'],
+        'ce_entry': ce['entry'],
+        'ce_ltp': ce['ltp'],
+        'ce_tgt': ce['tgt'],
+        'ce_exit': ce['exit'],
+        'ce_points': round(ce['points'], 2),
+        'ce_invest': round(ce['invest'], 2),
+        'ce_profit': round(ce['profit'], 2),
+    }
+    vals_attr = html_lib.escape(json.dumps(sort_vals), quote=True)
     band = 'row-band-b' if pos_idx % 2 else 'row-band-a'
 
+    rows = []
     for i, leg in enumerate(('ce', 'pe')):
         lc = leg_calc[leg]
         ltp_style = 'background-color:#0b6623;color:#fff;font-weight:700' if lc['tgt_hit'] else ''
@@ -749,16 +771,25 @@ for pos_idx, e in enumerate(display_list):
             cells.append(f'<td rowspan="2" class="{band}" style="{pnl_style(net_profit)}">{net_pct:.1f}%</td>')
             cells.append(f'<td rowspan="2" class="{band}">{exit_date_str}</td>')
             cells.append(f'<td rowspan="2" class="{band}">{esc(p.get("remarks") or "")}</td>')
-        body_rows_html.append('<tr>' + ''.join(cells) + '</tr>')
+        rows.append('<tr>' + ''.join(cells) + '</tr>')
 
-# Excel export — deliberately ALWAYS covers every position, ignoring the
-# search box, so "Download as Excel" stays a full backup no matter what's
-# currently filtered on screen. (This is also what "Restore from Excel
-# Backup" logic elsewhere reads back in — it must never be a partial file.)
-export_open = sorted((e for e in enriched if e['is_open']), key=sort_key, reverse=sort_desc)
-export_closed = sorted((e for e in enriched if not e['is_open']), key=sort_key, reverse=sort_desc)
+    body_blocks_html.append(
+        f'<tbody data-open="{1 if e["is_open"] else 0}" data-vals="{vals_attr}">'
+        + ''.join(rows) + '</tbody>'
+    )
+
+header_cells = []
+for label, key, tooltip in TABLE_COLUMNS:
+    title_attr = f' title="{esc(tooltip)}"' if tooltip else ''
+    header_cells.append(f'<th data-key="{key}" data-label="{esc(label)}"{title_attr}>{esc(label)}</th>')
+
+# Excel export — deliberately covers EVERY position regardless of the
+# on-screen search box, so "Download as Excel" always stays a full
+# backup no matter what's currently filtered/sorted on screen. (This
+# also matters because a previous version of this app relied on that
+# same download to recover from a data-loss incident.)
 export_rows = []
-for e in export_open + export_closed:
+for e in initial_order:
     p, leg_calc = e['p'], e['leg_calc']
     lot = p.get('lot_size') or 0
     for leg in ('ce', 'pe'):
@@ -767,45 +798,100 @@ for e in export_open + export_closed:
             e['net_invest'], e['net_profit'], e['net_pct']
         ))
 
-st.markdown("""
-    <style>
-        .pnl-table-wrap { overflow-x: auto; border: 1px solid #d0d0d0; border-radius: 6px; }
-        table.pnl-table { border-collapse: collapse; width: 100%; font-size: 14px; white-space: nowrap; }
-        table.pnl-table th, table.pnl-table td {
-            border: 1px solid #d0d0d0; padding: 6px 10px; text-align: center;
-        }
-        table.pnl-table thead th {
-            background-color: #f4a261; color: #1a1a1a; font-weight: 700;
-            position: sticky; top: 0; z-index: 1;
-        }
-        table.pnl-table .row-band-a { background-color: #ffffff; }
-        table.pnl-table .row-band-b { background-color: #f7f9fb; }
-        table.pnl-table .sym-cell { background-color: #dbeeff !important; font-weight: 700; color: #0b3d91; }
-        table.pnl-table .entry-cell { background-color: #c6efce; font-weight: 600; }
-        table.pnl-table .exit-cell { background-color: #ffeb9c; font-weight: 600; }
-    </style>
-""", unsafe_allow_html=True)
+st.caption(f"Last Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
+st.caption(
+    "Click any column header to sort by it (click again to reverse). Open positions always stay "
+    "above closed ones. Leg columns (Strike/Qty/entry/LTP/TGT/exit/points/invest/profit) sort by "
+    "the CE leg's value."
+)
 
-table_html = f"""
+table_page_html = f"""
+<style>
+    body {{ margin:0; font-family: "Source Sans Pro", sans-serif; }}
+    #searchBox {{
+        width: 100%; box-sizing: border-box; padding: 8px 12px; margin-bottom: 8px;
+        border: 1px solid #d0d0d0; border-radius: 6px; font-size: 14px;
+    }}
+    .pnl-table-wrap {{ overflow: auto; max-height: 620px; border: 1px solid #d0d0d0; border-radius: 6px; }}
+    table.pnl-table {{ border-collapse: collapse; width: 100%; font-size: 14px; white-space: nowrap; }}
+    table.pnl-table th, table.pnl-table td {{
+        border: 1px solid #d0d0d0; padding: 6px 10px; text-align: center;
+    }}
+    table.pnl-table thead th {{
+        background-color: #f4a261; color: #1a1a1a; font-weight: 700;
+        position: sticky; top: 0; z-index: 1; cursor: pointer; user-select: none;
+    }}
+    table.pnl-table thead th:hover {{ background-color: #f0954a; }}
+    table.pnl-table .row-band-a {{ background-color: #ffffff; }}
+    table.pnl-table .row-band-b {{ background-color: #f7f9fb; }}
+    table.pnl-table .sym-cell {{ background-color: #dbeeff !important; font-weight: 700; color: #0b3d91; }}
+    table.pnl-table .entry-cell {{ background-color: #c6efce; font-weight: 600; }}
+    table.pnl-table .exit-cell {{ background-color: #ffeb9c; font-weight: 600; }}
+    #noMatch {{ padding: 10px; color: #555; font-style: italic; display: none; }}
+</style>
+
+<input id="searchBox" type="text" placeholder="🔍 Search S.no, symbol or remarks..." />
 <div class="pnl-table-wrap">
-<table class="pnl-table">
+<table class="pnl-table" id="pnlTable">
 <thead>
 <tr>
-    <th>S.no</th><th>Entry Date</th><th>SYMBOL</th><th>lot Size</th>
-    <th>Strike</th><th>Qty</th><th>entry</th><th>LTP</th><th>TGT</th><th>exit</th>
-    <th>points</th><th>invest</th><th>profit</th>
-    <th>Net Invest</th><th>Net Profit</th><th>profit%</th><th>Exit Date</th><th>remarks</th>
+{''.join(header_cells)}
 </tr>
 </thead>
-<tbody>
-{''.join(body_rows_html)}
-</tbody>
+{''.join(body_blocks_html)}
 </table>
 </div>
+<div id="noMatch">No positions match your search.</div>
+
+<script>
+(function() {{
+    var table = document.getElementById('pnlTable');
+    var currentSort = {{ key: null, dir: 1 }};
+
+    function cmp(a, b) {{
+        if (a === null || a === undefined) a = -Infinity;
+        if (b === null || b === undefined) b = -Infinity;
+        if (typeof a === 'string' && typeof b === 'string') return a.localeCompare(b);
+        return a - b;
+    }}
+
+    function applySort(key) {{
+        if (currentSort.key === key) {{ currentSort.dir *= -1; }} else {{ currentSort = {{ key: key, dir: 1 }}; }}
+        var bodies = Array.from(table.querySelectorAll('tbody'));
+        bodies.sort(function(ta, tb) {{
+            var openA = ta.dataset.open === '1', openB = tb.dataset.open === '1';
+            if (openA !== openB) return openA ? -1 : 1;
+            var va = JSON.parse(ta.dataset.vals), vb = JSON.parse(tb.dataset.vals);
+            return cmp(va[key], vb[key]) * currentSort.dir;
+        }});
+        bodies.forEach(function(tb) {{ table.appendChild(tb); }});
+        document.querySelectorAll('th[data-key]').forEach(function(th) {{
+            var base = th.dataset.label;
+            th.textContent = (th.dataset.key === key) ? (base + (currentSort.dir === 1 ? ' \\u25B2' : ' \\u25BC')) : base;
+        }});
+    }}
+
+    document.querySelectorAll('th[data-key]').forEach(function(th) {{
+        th.addEventListener('click', function() {{ applySort(th.dataset.key); }});
+    }});
+
+    document.getElementById('searchBox').addEventListener('input', function() {{
+        var term = this.value.trim().toUpperCase();
+        var visible = 0;
+        document.querySelectorAll('#pnlTable tbody').forEach(function(tb) {{
+            var vals = JSON.parse(tb.dataset.vals);
+            var hay = (vals.symbol + ' ' + (vals.remarks || '') + ' ' + vals.sno).toUpperCase();
+            var show = !term || hay.indexOf(term) !== -1;
+            tb.style.display = show ? '' : 'none';
+            if (show) visible++;
+        }});
+        document.getElementById('noMatch').style.display = (term && visible === 0) ? 'block' : 'none';
+    }});
+}})();
+</script>
 """
 
-st.caption(f"Last Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
-st.markdown(table_html, unsafe_allow_html=True)
+components.html(table_page_html, height=700, scrolling=True)
 
 # ------------------------------------------------------------
 # Excel download + clear-all
