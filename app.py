@@ -32,7 +32,7 @@ from storage import (
 # before you actually place a trade. Persistence (GitHub Gist) setup
 # instructions live in storage.py.
 # ============================================================
-st.set_page_config(page_title="Hedge PNL Tracker", page_icon="📈", layout="wide")
+st.set_page_config(page_title="PNL Tracker", page_icon="📈", layout="wide")
 
 st.markdown("""
     <style>
@@ -310,8 +310,7 @@ with st.sidebar:
 # ============================================================
 # Main page
 # ============================================================
-st.title("Hedge PNL Tracker")
-st.caption("Every position = one symbol, one CE leg, one PE leg. LTP is the only thing pulled from the API automatically. Need to plan a trade before entering it? Use **Calculator** in the sidebar.")
+st.title("PNL Tracker")
 
 positions = load_positions()
 
@@ -561,11 +560,22 @@ if alerts_changed:
 if alert_failures:
     st.warning("Telegram alert failed to send: " + "; ".join(alert_failures[:3]))
 
+def _colored_metric(label, value_str, val):
+    color = '#0b6623' if val > 0 else ('#c0392b' if val < 0 else 'inherit')
+    st.markdown(
+        f'<div style="font-size:0.875rem;color:rgba(49,51,63,0.6);line-height:1.2;">{esc(label)}</div>'
+        f'<div style="font-size:2.25rem;font-weight:600;color:{color};line-height:1.3;">{esc(value_str)}</div>',
+        unsafe_allow_html=True,
+    )
+
+
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Open Legs", open_legs)
 m2.metric("Total Invested", f"₹{total_invest:,.0f}")
-m3.metric("Total Net Profit", f"₹{total_profit:,.0f}")
-m4.metric("Overall PNL %", f"{overall_pct:.1f}%")
+with m3:
+    _colored_metric("Total Net Profit", f"₹{total_profit:,.0f}", total_profit)
+with m4:
+    _colored_metric("Overall PNL %", f"{overall_pct:.1f}%", overall_pct)
 
 # ------------------------------------------------------------
 # Interactive table — every column header is clickable to sort (click
@@ -750,12 +760,6 @@ for e in initial_order:
         ))
 
 st.caption(f"Last Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
-st.caption(
-    "Click any column header to sort by it (click again to reverse). Open positions always stay "
-    "above closed ones. Leg columns (Strike/Qty/entry/LTP/TGT/exit/points/invest/profit) sort by "
-    "the CE leg's value. TGT % is the profit% you'd land on if every taken leg's target were hit. "
-    "A closed position's whole row turns green (profit) or red (loss)."
-)
 
 table_page_html = f"""
 <style>
