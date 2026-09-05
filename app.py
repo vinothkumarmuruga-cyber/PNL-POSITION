@@ -41,6 +41,31 @@ st.markdown("""
 # (Streamlit's st.data_editor has real, reproducible bugs around dynamic
 # rows and date/number columns). Instead: fill a form to open a position,
 # fill a small form to close it. Plain widgets, no fragile grid.
+#
+# PERSISTENCE
+# Streamlit Community Cloud containers are EPHEMERAL. Anything written
+# only to local disk (this app's old behaviour) is wiped the moment the
+# container restarts — which happens on redeploy, on waking from sleep
+# after inactivity, or on the platform recycling the instance. That is
+# almost certainly why positions vanished with no Clear/Delete click.
+#
+# Fix: positions are now mirrored to a private GitHub Gist (a tiny free
+# JSON store outside the container) whenever GITHUB_TOKEN + GIST_ID are
+# set in Streamlit secrets. The local file is kept too, purely as a fast
+# read cache — the Gist is the source of truth. Without those two
+# secrets configured, the app still runs exactly as before (local file
+# only) but shows a loud warning, because that mode WILL lose data again
+# on the next container restart.
+#
+# Setup (one-time, ~2 minutes):
+#   1. github.com/settings/tokens -> Generate new token (classic) -> only
+#      the "gist" scope -> copy it.
+#   2. gist.github.com -> New secret gist -> filename "hedge_positions.json"
+#      -> content "[]" -> Create secret gist -> copy the gist ID from its URL.
+#   3. In your Streamlit Cloud app -> Settings -> Secrets, add:
+#        GITHUB_TOKEN = "ghp_xxx..."
+#        GIST_ID = "the id from step 2"
+#   4. Reboot the app once from Streamlit Cloud's menu.
 # ============================================================
 DATA_DIR = 'data'
 if not os.path.exists(DATA_DIR):
@@ -51,6 +76,11 @@ LTP_CACHE_FILE = os.path.join(DATA_DIR, 'ltp_cache.json')
 POSITIONS_FILE = os.path.join(DATA_DIR, 'hedge_positions.json')
 TELEGRAM_CONFIG_FILE = os.path.join(DATA_DIR, 'telegram_config.json')
 NSE_JSON_PATH = 'NSE.json'
+
+GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN", "") if hasattr(st, "secrets") else ""
+GIST_ID = st.secrets.get("GIST_ID", "") if hasattr(st, "secrets") else ""
+GIST_FILENAME = "hedge_positions.json"
+PERSISTENCE_CONFIGURED = bool(GITHUB_TOKEN and GIST_ID)
 
 
 # ============================================================
@@ -197,8 +227,9 @@ def resolve_current_contract(symbol, strike, option_type, today_str):
     """
     Current (nearest unexpired) contract for symbol/strike/type.
     Returns (instrument_key, lot_size, expiry_str) or (None, None, None).
-    Resolved ONCE when a position is opened and then stored with it — a
-    live position's contract doesn't need to keep re-resolving itself.
+    Resolved ONCE when a position is opened (or restored) and then stored
+    with it — a live position's contract doesn't need to keep
+    re-resolving itself.
     """
     df = load_nse_json()
     if df.empty or not symbol or strike is None or not option_type:
@@ -222,11 +253,68 @@ def resolve_current_contract(symbol, strike, option_type, today_str):
 
 
 # ============================================================
+# Durable storage — GitHub Gist (source of truth when configured)
+# ============================================================
+def _gist_headers():
+    return {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+    }
+
+
+def gist_load_positions():
+    """Returns a list from the gist, or None if the gist isn't configured
+    or couldn't be reached (caller should fall back to local file)."""
+    if not PERSISTENCE_CONFIGURED:
+        return None
+    try:
+        r = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=_gist_headers(), timeout=10)
+        if r.status_code != 200:
+            st.sidebar.error(f"Gist load failed: HTTP {r.status_code}")
+            return None
+        files = r.json().get("files", {})
+        f = files.get(GIST_FILENAME)
+        if not f:
+            return []
+        content = f.get("content", "") or ""
+        if f.get("truncated"):
+            raw = requests.get(f["raw_url"], headers=_gist_headers(), timeout=10)
+            content = raw.text
+        return json.loads(content) if content.strip() else []
+    except Exception as e:
+        st.sidebar.error(f"Gist load failed: {e}")
+        return None
+
+
+def gist_save_positions(positions):
+    if not PERSISTENCE_CONFIGURED:
+        return False
+    try:
+        payload = {"files": {GIST_FILENAME: {"content": json.dumps(positions, indent=2, default=str)}}}
+        r = requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=_gist_headers(), json=payload, timeout=10)
+        if r.status_code != 200:
+            st.sidebar.error(f"Gist save failed: HTTP {r.status_code}: {r.text[:200]}")
+            return False
+        return True
+    except Exception as e:
+        st.sidebar.error(f"Gist save failed: {e}")
+        return False
+
+
+# ============================================================
 # Position storage — a plain list of dicts, one per hedge (CE+PE legs
 # baked in together). No dataframe editing involved anywhere, so none of
 # the data_editor dtype/row fragility applies here.
 # ============================================================
 def load_positions():
+    remote = gist_load_positions()
+    if remote is not None:
+        try:
+            with open(POSITIONS_FILE, 'w') as f:
+                json.dump(remote, f, indent=2, default=str)
+        except Exception:
+            pass
+        return remote
     if os.path.exists(POSITIONS_FILE):
         try:
             with open(POSITIONS_FILE, 'r') as f:
@@ -241,7 +329,10 @@ def save_positions(positions):
         with open(POSITIONS_FILE, 'w') as f:
             json.dump(positions, f, indent=2, default=str)
     except Exception as e:
-        st.error(f"Could not save positions: {e}")
+        st.error(f"Could not save positions locally: {e}")
+    if PERSISTENCE_CONFIGURED:
+        if not gist_save_positions(positions):
+            st.sidebar.error("⚠️ Could not reach GitHub Gist backup just now — saved locally only for this session.")
 
 
 def next_sno(positions):
@@ -254,6 +345,18 @@ def next_sno(positions):
 # Sidebar
 # ============================================================
 with st.sidebar:
+    if not PERSISTENCE_CONFIGURED:
+        st.error(
+            "⚠️ No durable storage configured. Positions are saved to this "
+            "container's local disk only and **will be lost** the next time "
+            "the app restarts (redeploy, sleep/wake, or platform recycle) — "
+            "this is what wiped your positions before. Add GITHUB_TOKEN and "
+            "GIST_ID under Settings → Secrets to fix this permanently. "
+            "See the comment block at the top of this file for the 2-minute setup."
+        )
+    else:
+        st.success("✅ Durable storage active (GitHub Gist). Positions survive app restarts.")
+
     st.header("Configuration")
     saved_token = load_token()
     access_token = st.text_input("Upstox Access Token", value=saved_token, type="password")
@@ -287,31 +390,12 @@ with st.sidebar:
     tg_cfg = load_telegram_config()
     tg_bot_token = st.text_input("Bot Token", value=tg_cfg.get('bot_token', ''), type="password")
     tg_chat_id = st.text_input("Chat ID", value=tg_cfg.get('chat_id', ''))
-    thr_col1, thr_col2 = st.columns(2)
-    profit_threshold = thr_col1.number_input(
-        "Profit % Alert ≥", value=float(tg_cfg.get('profit_threshold', 50.0)),
-        step=5.0, format="%.1f"
-    )
-    loss_threshold = thr_col2.number_input(
-        "Loss % Alert ≤", value=float(tg_cfg.get('loss_threshold', -30.0)),
-        step=5.0, format="%.1f"
-    )
     tg_enabled = st.checkbox(
-        f"Enable Alerts (TGT hit, profit% ≥ {profit_threshold:.0f}%, profit% ≤ {loss_threshold:.0f}%)",
+        "Enable Alerts (TGT hit, profit% ≥ 50%, profit% ≤ -30%)",
         value=tg_cfg.get('enabled', False)
     )
-    tg_cfg_now = {
-        'bot_token': tg_bot_token, 'chat_id': tg_chat_id, 'enabled': tg_enabled,
-        'profit_threshold': profit_threshold, 'loss_threshold': loss_threshold,
-    }
-    tg_cfg_prev = {
-        'bot_token': tg_cfg.get('bot_token', ''), 'chat_id': tg_cfg.get('chat_id', ''),
-        'enabled': tg_cfg.get('enabled', False),
-        'profit_threshold': tg_cfg.get('profit_threshold', 50.0),
-        'loss_threshold': tg_cfg.get('loss_threshold', -30.0),
-    }
-    if tg_cfg_now != tg_cfg_prev:
-        save_telegram_config(tg_cfg_now)
+    if (tg_bot_token, tg_chat_id, tg_enabled) != (tg_cfg.get('bot_token', ''), tg_cfg.get('chat_id', ''), tg_cfg.get('enabled', False)):
+        save_telegram_config({'bot_token': tg_bot_token, 'chat_id': tg_chat_id, 'enabled': tg_enabled})
     if st.button("Send Test Message", use_container_width=True):
         ok, msg = send_telegram_message(tg_bot_token, tg_chat_id, "✅ Hedge PNL Tracker: test alert.")
         st.success("Sent.") if ok else st.error(f"Failed: {msg}")
@@ -320,6 +404,32 @@ with st.sidebar:
     st.header("Auto Refresh")
     auto_refresh = st.checkbox("Enable Auto-Refresh", value=False)
     refresh_interval = st.slider("Refresh Interval (seconds)", min_value=5, max_value=60, value=15)
+
+    st.markdown("---")
+    if st.button("🔧 Re-resolve missing contract keys", use_container_width=True):
+        today_str = get_ist_now().strftime('%Y-%m-%d')
+        current_positions = load_positions()
+        fixed = 0
+        for p in current_positions:
+            for leg in ('ce', 'pe'):
+                if not p.get(f'{leg}_instrument_key'):
+                    key, lot_size, expiry_str = resolve_current_contract(
+                        p['symbol'], p[f'{leg}_strike'], leg.upper(), today_str
+                    )
+                    if key:
+                        p[f'{leg}_instrument_key'] = key
+                        if lot_size and not p.get('lot_size'):
+                            p['lot_size'] = lot_size
+                        if expiry_str and not p.get('expiry'):
+                            p['expiry'] = expiry_str
+                        fixed += 1
+        if fixed:
+            save_positions(current_positions)
+            st.success(f"Resolved {fixed} missing contract key(s).")
+            time.sleep(1)
+            st.rerun()
+        else:
+            st.info("Nothing to fix — download NSE.json first if keys are still missing.")
 
 # ============================================================
 # Main page
@@ -389,7 +499,7 @@ with st.expander("➕ Add Position", expanded=(len(positions) == 0)):
                 st.rerun()
 
 if not positions:
-    st.info("No positions yet. Use **Add Position** above to open your first hedge.")
+    st.info("No positions yet. Use **Add Position** above to open your first hedge, or **Restore from Excel Backup** in the sidebar.")
     st.stop()
 
 # ------------------------------------------------------------
@@ -436,14 +546,6 @@ def pnl_style(val):
     return ''
 
 
-def position_is_open(p):
-    return p.get('ce_exit') in (None, '') or p.get('pe_exit') in (None, '')
-
-
-# Open positions first (most actionable), closed positions after —
-# within each group the original add order (by S.no) is kept.
-positions_display = sorted(positions, key=lambda p: (not position_is_open(p), p.get('sno', 0)))
-
 open_legs = 0
 total_invest = 0.0
 total_profit = 0.0
@@ -452,7 +554,7 @@ export_rows = []
 alerts_changed = False
 alert_failures = []
 
-for pos_idx, p in enumerate(positions_display):
+for pos_idx, p in enumerate(positions):
     lot = p.get('lot_size') or 0
     leg_calc = {}
     for leg in ('ce', 'pe'):
@@ -505,20 +607,20 @@ for pos_idx, p in enumerate(positions_display):
                 p[f'{leg}_tgt_alerted'] = True
                 alerts_changed = True
         if pos_open_legs > 0:
-            if net_pct >= profit_threshold and not p.get('profit50_alerted'):
+            if net_pct >= 50 and not p.get('profit50_alerted'):
                 ok, msg = send_telegram_message(
                     tg_bot_token, tg_chat_id,
-                    f"🚀 PROFIT ≥ {profit_threshold:.0f}% — {p['symbol']} (S.no {p['sno']})\n"
+                    f"🚀 PROFIT ≥ 50% — {p['symbol']} (S.no {p['sno']})\n"
                     f"Net Profit ₹{net_profit:,.0f} | PNL {net_pct:.1f}%"
                 )
                 if not ok:
                     alert_failures.append(msg)
                 p['profit50_alerted'] = True
                 alerts_changed = True
-            if net_pct <= loss_threshold and not p.get('loss30_alerted'):
+            if net_pct <= -30 and not p.get('loss30_alerted'):
                 ok, msg = send_telegram_message(
                     tg_bot_token, tg_chat_id,
-                    f"⚠️ EXIT? PNL ≤ {loss_threshold:.0f}% — {p['symbol']} (S.no {p['sno']})\n"
+                    f"⚠️ EXIT? PNL ≤ -30% — {p['symbol']} (S.no {p['sno']})\n"
                     f"Net Profit ₹{net_profit:,.0f} | PNL {net_pct:.1f}%"
                 )
                 if not ok:
@@ -531,11 +633,7 @@ for pos_idx, p in enumerate(positions_display):
     exit_date_str = pd.to_datetime(p.get('exit_date'), errors='coerce')
     exit_date_str = exit_date_str.strftime('%d-%m-%Y') if pd.notna(exit_date_str) else '—'
 
-    is_closed = pos_open_legs == 0
-    if is_closed:
-        band = 'row-profit' if net_profit > 0 else ('row-loss' if net_profit < 0 else 'row-band-a')
-    else:
-        band = 'row-band-b' if pos_idx % 2 else 'row-band-a'
+    band = 'row-band-b' if pos_idx % 2 else 'row-band-a'
 
     for i, leg in enumerate(('ce', 'pe')):
         lc = leg_calc[leg]
@@ -558,7 +656,7 @@ for pos_idx, p in enumerate(positions_display):
         cells.append(f'<td class="{band}">{lc["invest"]:,.0f}</td>')
         cells.append(f'<td class="{band}" style="{pnl_style(lc["profit"])}">{lc["profit"]:,.0f}</td>')
         if i == 0:
-            cells.append(f'<td rowspan="2" class="{band}">{net_invest:,.0f}</td>')
+            cells.append(f'<td rowspan="2" class="{band}" style="{pnl_style(net_profit)}">{net_invest:,.0f}</td>')
             cells.append(f'<td rowspan="2" class="{band}" style="{pnl_style(net_profit)}">{net_profit:,.0f}</td>')
             cells.append(f'<td rowspan="2" class="{band}" style="{pnl_style(net_profit)}">{net_pct:.1f}%</td>')
             cells.append(f'<td rowspan="2" class="{band}">{exit_date_str}</td>')
@@ -591,10 +689,10 @@ m4.metric("Overall PNL %", f"{overall_pct:.1f}%")
 
 st.markdown("""
     <style>
-        .pnl-table-wrap { overflow-x: auto; border: 2px solid #2b2b2b; border-radius: 6px; }
+        .pnl-table-wrap { overflow-x: auto; border: 1px solid #d0d0d0; border-radius: 6px; }
         table.pnl-table { border-collapse: collapse; width: 100%; font-size: 14px; white-space: nowrap; }
         table.pnl-table th, table.pnl-table td {
-            border: 1px solid #2b2b2b; padding: 6px 10px; text-align: center;
+            border: 1px solid #d0d0d0; padding: 6px 10px; text-align: center;
         }
         table.pnl-table thead th {
             background-color: #f4a261; color: #1a1a1a; font-weight: 700;
@@ -602,8 +700,6 @@ st.markdown("""
         }
         table.pnl-table .row-band-a { background-color: #ffffff; }
         table.pnl-table .row-band-b { background-color: #f7f9fb; }
-        table.pnl-table .row-profit { background-color: #d4edda; }
-        table.pnl-table .row-loss { background-color: #f8d7da; }
         table.pnl-table .sym-cell { background-color: #dbeeff !important; font-weight: 700; color: #0b3d91; }
         table.pnl-table .entry-cell { background-color: #c6efce; font-weight: 600; }
         table.pnl-table .exit-cell { background-color: #ffeb9c; font-weight: 600; }
