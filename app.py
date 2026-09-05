@@ -866,7 +866,7 @@ table_page_html = f"""
         width: 100%; box-sizing: border-box; padding: 8px 12px; margin-bottom: 8px;
         border: 1px solid #d0d0d0; border-radius: 6px; font-size: 14px;
     }}
-    .pnl-table-wrap {{ overflow: auto; max-height: 620px; border: 1px solid #d0d0d0; border-radius: 6px; }}
+    .pnl-table-wrap {{ overflow: auto; max-height: 1050px; border: 1px solid #d0d0d0; border-radius: 6px; }}
     table.pnl-table {{ border-collapse: collapse; width: 100%; font-size: 14px; white-space: nowrap; }}
     table.pnl-table th, table.pnl-table td {{
         border: 1px solid #d0d0d0; padding: 6px 10px; text-align: center;
@@ -945,7 +945,7 @@ table_page_html = f"""
 </script>
 """
 
-components.html(table_page_html, height=700, scrolling=True)
+components.html(table_page_html, height=1130, scrolling=True)
 
 # ------------------------------------------------------------
 # Excel download + clear-all
@@ -974,77 +974,77 @@ with clear_col:
             st.rerun()
 
 # ------------------------------------------------------------
-# Close / edit a position — plain widgets, no grid editing.
+# Close / edit a position — plain widgets, no grid editing. Collapsed
+# by default (like Add Position) so the table above gets the vertical
+# space instead of this form sitting open all the time.
 # ------------------------------------------------------------
-st.markdown("---")
-st.subheader("Close / Edit a Position")
+with st.expander("✏️ Close / Edit a Position", expanded=False):
+    options = {f"S.no {p['sno']} — {p['symbol']}": p['sno'] for p in positions}
+    choice = st.selectbox("Position", options=list(options.keys()))
+    sel_sno = options[choice]
+    pos = next(p for p in positions if p['sno'] == sel_sno)
 
-options = {f"S.no {p['sno']} — {p['symbol']}": p['sno'] for p in positions}
-choice = st.selectbox("Position", options=list(options.keys()))
-sel_sno = options[choice]
-pos = next(p for p in positions if p['sno'] == sel_sno)
+    with st.form("edit_position_form"):
+        st.caption("Entry / Qty")
+        e1, e2, e3, e4 = st.columns(4)
+        ce_entry_val = e1.number_input(
+            "CE Entry", min_value=0.0, step=0.05, format="%.2f",
+            value=float(pos.get('ce_entry') or 0.0)
+        )
+        ce_qty_val = e2.number_input(
+            "CE Qty", min_value=1, step=1,
+            value=int(pos.get('ce_qty') or 1)
+        )
+        pe_entry_val = e3.number_input(
+            "PE Entry", min_value=0.0, step=0.05, format="%.2f",
+            value=float(pos.get('pe_entry') or 0.0)
+        )
+        pe_qty_val = e4.number_input(
+            "PE Qty", min_value=1, step=1,
+            value=int(pos.get('pe_qty') or 1)
+        )
 
-with st.form("edit_position_form"):
-    st.caption("Entry / Qty")
-    e1, e2, e3, e4 = st.columns(4)
-    ce_entry_val = e1.number_input(
-        "CE Entry", min_value=0.0, step=0.05, format="%.2f",
-        value=float(pos.get('ce_entry') or 0.0)
-    )
-    ce_qty_val = e2.number_input(
-        "CE Qty", min_value=1, step=1,
-        value=int(pos.get('ce_qty') or 1)
-    )
-    pe_entry_val = e3.number_input(
-        "PE Entry", min_value=0.0, step=0.05, format="%.2f",
-        value=float(pos.get('pe_entry') or 0.0)
-    )
-    pe_qty_val = e4.number_input(
-        "PE Qty", min_value=1, step=1,
-        value=int(pos.get('pe_qty') or 1)
-    )
+        st.caption("Exit")
+        c1, c2 = st.columns(2)
+        ce_exit_val = c1.number_input(
+            "CE Exit", min_value=0.0, step=0.05, format="%.2f",
+            value=float(pos.get('ce_exit') or 0.0)
+        )
+        pe_exit_val = c2.number_input(
+            "PE Exit", min_value=0.0, step=0.05, format="%.2f",
+            value=float(pos.get('pe_exit') or 0.0)
+        )
+        exit_date_val = st.date_input(
+            "Exit Date",
+            value=pd.to_datetime(pos['exit_date']).date() if pos.get('exit_date') else get_ist_now().date()
+        )
+        remarks_val = st.text_input("Remarks", value=pos.get('remarks') or '')
 
-    st.caption("Exit")
-    c1, c2 = st.columns(2)
-    ce_exit_val = c1.number_input(
-        "CE Exit", min_value=0.0, step=0.05, format="%.2f",
-        value=float(pos.get('ce_exit') or 0.0)
-    )
-    pe_exit_val = c2.number_input(
-        "PE Exit", min_value=0.0, step=0.05, format="%.2f",
-        value=float(pos.get('pe_exit') or 0.0)
-    )
-    exit_date_val = st.date_input(
-        "Exit Date",
-        value=pd.to_datetime(pos['exit_date']).date() if pos.get('exit_date') else get_ist_now().date()
-    )
-    remarks_val = st.text_input("Remarks", value=pos.get('remarks') or '')
+        save_col, delete_col = st.columns(2)
+        save_clicked = save_col.form_submit_button("💾 Save", use_container_width=True)
+        delete_clicked = delete_col.form_submit_button("🗑️ Delete Position", use_container_width=True)
 
-    save_col, delete_col = st.columns(2)
-    save_clicked = save_col.form_submit_button("💾 Save", use_container_width=True)
-    delete_clicked = delete_col.form_submit_button("🗑️ Delete Position", use_container_width=True)
+        if save_clicked:
+            pos['ce_entry'] = ce_entry_val
+            pos['pe_entry'] = pe_entry_val
+            pos['ce_qty'] = int(ce_qty_val)
+            pos['pe_qty'] = int(pe_qty_val)
+            pos['ce_exit'] = ce_exit_val if ce_exit_val > 0 else None
+            pos['pe_exit'] = pe_exit_val if pe_exit_val > 0 else None
+            pos['exit_date'] = str(exit_date_val) if (ce_exit_val > 0 or pe_exit_val > 0) else None
+            pos['remarks'] = remarks_val
+            # Numbers changed — let TGT/profit% alerts re-evaluate from scratch.
+            for flag in ('ce_tgt_alerted', 'pe_tgt_alerted', 'profit50_alerted', 'loss30_alerted'):
+                pos.pop(flag, None)
+            save_positions(positions)
+            st.success(f"Saved S.no {sel_sno}")
+            st.rerun()
 
-    if save_clicked:
-        pos['ce_entry'] = ce_entry_val
-        pos['pe_entry'] = pe_entry_val
-        pos['ce_qty'] = int(ce_qty_val)
-        pos['pe_qty'] = int(pe_qty_val)
-        pos['ce_exit'] = ce_exit_val if ce_exit_val > 0 else None
-        pos['pe_exit'] = pe_exit_val if pe_exit_val > 0 else None
-        pos['exit_date'] = str(exit_date_val) if (ce_exit_val > 0 or pe_exit_val > 0) else None
-        pos['remarks'] = remarks_val
-        # Numbers changed — let TGT/profit% alerts re-evaluate from scratch.
-        for flag in ('ce_tgt_alerted', 'pe_tgt_alerted', 'profit50_alerted', 'loss30_alerted'):
-            pos.pop(flag, None)
-        save_positions(positions)
-        st.success(f"Saved S.no {sel_sno}")
-        st.rerun()
-
-    if delete_clicked:
-        positions = [p for p in positions if p['sno'] != sel_sno]
-        save_positions(positions)
-        st.success(f"Deleted S.no {sel_sno}")
-        st.rerun()
+        if delete_clicked:
+            positions = [p for p in positions if p['sno'] != sel_sno]
+            save_positions(positions)
+            st.success(f"Deleted S.no {sel_sno}")
+            st.rerun()
 
 if auto_refresh:
     time.sleep(refresh_interval)
