@@ -307,7 +307,7 @@ with st.sidebar:
         value=float(tg_cfg.get('loss_threshold', -30.0)), step=5.0
     )
     tg_enabled = st.checkbox(
-        f"Enable Alerts (TGT hit, profit% ≥ {profit_alert_pct:.0f}%, profit% ≤ {loss_alert_pct:.0f}%)",
+        f"Enable Alerts (profit% ≥ {profit_alert_pct:.0f}%, profit% ≤ {loss_alert_pct:.0f}%, profit% crosses TGT%)",
         value=tg_cfg.get('enabled', False)
     )
     tg_new_cfg = {
@@ -565,47 +565,47 @@ def render_pnl_tab():
             else:
                 closed_invest += lc['invest']
                 closed_profit += lc['profit']
-        # --- Telegram alerts: TGT hit / profit% >= threshold / profit% <= threshold ---
-        # OPEN POSITIONS ONLY (pos_open_legs > 0 / lc['is_open']) — a fully
-        # closed position never alerts. Each condition fires AT MOST ONCE PER
-        # CALENDAR DAY: the "alerted" marker is stamped with today's date, so
-        # a price that oscillates back and forth across the threshold all day
-        # doesn't flood Telegram with repeats — and it auto-rearms the next
-        # trading day on its own, no manual edit/save needed.
-        if tg_enabled:
-            for leg in ('ce', 'pe'):
-                lc = leg_calc[leg]
-                if lc['tgt_hit'] and p.get(f'{leg}_tgt_alerted_date') != alert_today_str:
-                    ok, msg = send_telegram_message(
-                        tg_bot_token, tg_chat_id,
-                        f"🎯 TGT HIT — {p['symbol']} {lc['strike']:.0f} {leg.upper()} "
-                        f"(S.no {p['sno']})\nLTP {lc['ltp']:.2f} reached target {lc['tgt']:.2f}"
-                    )
-                    if not ok:
-                        alert_failures.append(msg)
-                    p[f'{leg}_tgt_alerted_date'] = alert_today_str
-                    alerts_changed = True
-            if pos_open_legs > 0:
-                if net_pct >= profit_alert_pct and p.get('profit50_alerted_date') != alert_today_str:
-                    ok, msg = send_telegram_message(
-                        tg_bot_token, tg_chat_id,
-                        f"🚀 PROFIT ≥ {profit_alert_pct:.0f}% — {p['symbol']} (S.no {p['sno']})\n"
-                        f"Net Profit ₹{net_profit:,.0f} | PNL {net_pct:.1f}%"
-                    )
-                    if not ok:
-                        alert_failures.append(msg)
-                    p['profit50_alerted_date'] = alert_today_str
-                    alerts_changed = True
-                if net_pct <= loss_alert_pct and p.get('loss30_alerted_date') != alert_today_str:
-                    ok, msg = send_telegram_message(
-                        tg_bot_token, tg_chat_id,
-                        f"⚠️ EXIT? PNL ≤ {loss_alert_pct:.0f}% — {p['symbol']} (S.no {p['sno']})\n"
-                        f"Net Profit ₹{net_profit:,.0f} | PNL {net_pct:.1f}%"
-                    )
-                    if not ok:
-                        alert_failures.append(msg)
-                    p['loss30_alerted_date'] = alert_today_str
-                    alerts_changed = True
+        # --- Telegram alerts: profit% >= threshold / profit% <= threshold / profit% crossed above TGT% ---
+        # OPEN POSITIONS ONLY (pos_open_legs > 0) — a fully closed position
+        # never alerts. Each condition fires AT MOST ONCE PER CALENDAR DAY:
+        # the "alerted" marker is stamped with today's date, so a price that
+        # oscillates back and forth across the threshold all day doesn't
+        # flood Telegram with repeats — and it auto-rearms the next trading
+        # day on its own, no manual edit/save needed.
+        if tg_enabled and pos_open_legs > 0:
+            if net_pct >= profit_alert_pct and p.get('profit50_alerted_date') != alert_today_str:
+                ok, msg = send_telegram_message(
+                    tg_bot_token, tg_chat_id,
+                    f"🚀 PROFIT ≥ {profit_alert_pct:.0f}% — {p['symbol']} (S.no {p['sno']})\n"
+                    f"Net Profit ₹{net_profit:,.0f} | PNL {net_pct:.1f}%"
+                )
+                if not ok:
+                    alert_failures.append(msg)
+                p['profit50_alerted_date'] = alert_today_str
+                alerts_changed = True
+            if net_pct <= loss_alert_pct and p.get('loss30_alerted_date') != alert_today_str:
+                ok, msg = send_telegram_message(
+                    tg_bot_token, tg_chat_id,
+                    f"⚠️ EXIT? PNL ≤ {loss_alert_pct:.0f}% — {p['symbol']} (S.no {p['sno']})\n"
+                    f"Net Profit ₹{net_profit:,.0f} | PNL {net_pct:.1f}%"
+                )
+                if not ok:
+                    alert_failures.append(msg)
+                p['loss30_alerted_date'] = alert_today_str
+                alerts_changed = True
+            # NEW: profit% has caught up to / crossed above the TGT% you set
+            # for this hedge (only meaningful once a target is actually set,
+            # i.e. tgt_pct > 0).
+            if tgt_pct > 0 and net_pct >= tgt_pct and p.get('tgtpct_crossed_date') != alert_today_str:
+                ok, msg = send_telegram_message(
+                    tg_bot_token, tg_chat_id,
+                    f"🎯 PROFIT% CROSSED TGT% — {p['symbol']} (S.no {p['sno']})\n"
+                    f"Profit {net_pct:.1f}% ≥ Target {tgt_pct:.1f}% | Net Profit ₹{net_profit:,.0f}"
+                )
+                if not ok:
+                    alert_failures.append(msg)
+                p['tgtpct_crossed_date'] = alert_today_str
+                alerts_changed = True
         entry_date_parsed = pd.to_datetime(p.get('entry_date'), errors='coerce')
         exit_date_parsed = pd.to_datetime(p.get('exit_date'), errors='coerce')
         entry_date_str = entry_date_parsed.strftime('%d-%m-%Y') if pd.notna(entry_date_parsed) else '—'
@@ -1015,11 +1015,12 @@ def render_pnl_tab():
                         pos['expiry'] = pe_expiry
                     if not pe_key:
                         st.warning("Couldn't match the new PE strike to a live contract — download NSE.json first.")
-                # Numbers changed — let TGT/profit% alerts re-evaluate today too
-                # (also clear the old boolean-flag fields from before alerts
-                # switched to once-per-day, in case they're still lingering).
+                # Numbers changed — let profit%/TGT% alerts re-evaluate today
+                # too (also clear old flag fields from earlier alert designs,
+                # in case they're still lingering on this position).
                 for flag in (
-                    'ce_tgt_alerted_date', 'pe_tgt_alerted_date', 'profit50_alerted_date', 'loss30_alerted_date',
+                    'profit50_alerted_date', 'loss30_alerted_date', 'tgtpct_crossed_date',
+                    'ce_tgt_alerted_date', 'pe_tgt_alerted_date',
                     'ce_tgt_alerted', 'pe_tgt_alerted', 'profit50_alerted', 'loss30_alerted',
                 ):
                     pos.pop(flag, None)
