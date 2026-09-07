@@ -246,7 +246,7 @@ with st.sidebar:
         st.success("Sent.") if ok else st.error(f"Failed: {msg}")
     st.markdown("---")
     st.header("Refresh")
-    manual_refresh_clicked = st.button("🔄 Refresh Now", use_container_width=True)
+    st.caption("Manual refresh button is at the top of the page.")
     auto_refresh = st.checkbox("Enable Auto-Refresh", value=False)
     refresh_interval_min = st.slider("Refresh Interval (minutes)", min_value=1, max_value=60, value=1)
     st.markdown("---")
@@ -277,7 +277,12 @@ with st.sidebar:
 # ============================================================
 # Main page
 # ============================================================
-st.title("PNL Tracker")
+title_col, refresh_col = st.columns([8, 1])
+with title_col:
+    st.title("PNL Tracker")
+with refresh_col:
+    st.write("")
+    manual_refresh_clicked = st.button("🔄 Refresh", use_container_width=True)
 positions = load_positions()
 # ------------------------------------------------------------
 # Open a new position
@@ -524,34 +529,34 @@ if alerts_changed:
     save_positions(positions)
 if alert_failures:
     st.warning("Telegram alert failed to send: " + "; ".join(alert_failures[:3]))
-def _colored_metric(label, value_str, val):
-    color = '#0b6623' if val > 0 else ('#c0392b' if val < 0 else 'inherit')
+# Compact metric blocks — deliberately small (0.68rem label / 1.05rem
+# value) so three groups x three numbers doesn't eat the page like
+# Streamlit's default st.metric size did.
+def _metric_block(label, value_str, val=None):
+    if val is None:
+        color = '#31333f'
+    else:
+        color = '#0b6623' if val > 0 else ('#c0392b' if val < 0 else '#31333f')
     st.markdown(
-        f'<div style="font-size:0.875rem;color:rgba(49,51,63,0.6);line-height:1.2;">{esc(label)}</div>'
-        f'<div style="font-size:2.25rem;font-weight:600;color:{color};line-height:1.3;">{esc(value_str)}</div>',
+        f'<div style="font-size:0.68rem;color:rgba(49,51,63,0.6);line-height:1.1;">{esc(label)}</div>'
+        f'<div style="font-size:1.05rem;font-weight:700;color:{color};line-height:1.2;">{esc(value_str)}</div>',
         unsafe_allow_html=True,
     )
-st.markdown("**Closed Legs**")
-cc1, cc2, cc3 = st.columns(3)
-cc1.metric("Invest", f"₹{closed_invest:,.0f}")
-with cc2:
-    _colored_metric("Profit", f"₹{closed_profit:,.0f}", closed_profit)
-with cc3:
-    _colored_metric("Profit %", f"{closed_pct:.1f}%", closed_pct)
-st.markdown("**Open Legs**")
-oo1, oo2, oo3 = st.columns(3)
-oo1.metric("Invest", f"₹{open_invest:,.0f}")
-with oo2:
-    _colored_metric("Profit", f"₹{open_profit:,.0f}", open_profit)
-with oo3:
-    _colored_metric("Profit %", f"{open_pct:.1f}%", open_pct)
-st.markdown("**Total**")
-tt1, tt2, tt3 = st.columns(3)
-tt1.metric("Invest", f"₹{total_invest:,.0f}")
-with tt2:
-    _colored_metric("Profit", f"₹{total_profit:,.0f}", total_profit)
-with tt3:
-    _colored_metric("Profit %", f"{overall_pct:.1f}%", overall_pct)
+def _metric_group(title, invest, profit, pct):
+    st.markdown(
+        f'<div style="font-weight:700;font-size:0.8rem;margin-top:2px;margin-bottom:2px;">{esc(title)}</div>',
+        unsafe_allow_html=True,
+    )
+    g1, g2, g3 = st.columns(3)
+    with g1:
+        _metric_block("Invest", f"₹{invest:,.0f}")
+    with g2:
+        _metric_block("Profit", f"₹{profit:,.0f}", profit)
+    with g3:
+        _metric_block("Profit %", f"{pct:.1f}%", pct)
+_metric_group("Closed Legs", closed_invest, closed_profit, closed_pct)
+_metric_group("Open Legs", open_invest, open_profit, open_pct)
+_metric_group("Total", total_invest, total_profit, overall_pct)
 # ------------------------------------------------------------
 # Interactive table — every column header is clickable to sort (click
 # again to reverse), plus an instant search box. Both run entirely in
@@ -948,5 +953,15 @@ with st.expander("✏️ Close / Edit a Position", expanded=False):
             st.success(f"Deleted S.no {sel_sno}")
             st.rerun()
 if auto_refresh:
-    time.sleep(refresh_interval_min * 60)
-    st.rerun()
+    # Do NOT use time.sleep() + st.rerun() here — that blocks the app's
+    # single Python thread for the whole interval, so the page just sits
+    # on a permanent "running" spinner (worse the longer the interval,
+    # and can drop the connection entirely on some hosts). Instead, hand
+    # a plain JS timer to the browser: the page renders normally and
+    # stays interactive, and the browser itself reloads when the timer
+    # fires — no server-side blocking at all.
+    refresh_ms = int(refresh_interval_min * 60 * 1000)
+    components.html(
+        f"<script>setTimeout(function() {{ window.parent.location.reload(); }}, {refresh_ms});</script>",
+        height=0,
+    )
