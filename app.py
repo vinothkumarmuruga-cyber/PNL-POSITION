@@ -529,34 +529,35 @@ if alerts_changed:
     save_positions(positions)
 if alert_failures:
     st.warning("Telegram alert failed to send: " + "; ".join(alert_failures[:3]))
-# Compact metric blocks — deliberately small (0.68rem label / 1.05rem
-# value) so three groups x three numbers doesn't eat the page like
-# Streamlit's default st.metric size did.
-def _metric_block(label, value_str, val=None):
+# Compact metric blocks — 20px values. Invest (no inherent sign) is
+# colored per-group so Closed/Open/Total read as three distinct blocks;
+# Profit and Profit% keep red/green tied to actual gain/loss, since that
+# signal matters more than a fixed color.
+def _metric_block(label, value_str, val=None, neutral_color='#31333f'):
     if val is None:
-        color = '#31333f'
+        color = neutral_color
     else:
-        color = '#0b6623' if val > 0 else ('#c0392b' if val < 0 else '#31333f')
+        color = '#0b6623' if val > 0 else ('#c0392b' if val < 0 else neutral_color)
     st.markdown(
-        f'<div style="font-size:0.68rem;color:rgba(49,51,63,0.6);line-height:1.1;">{esc(label)}</div>'
-        f'<div style="font-size:1.05rem;font-weight:700;color:{color};line-height:1.2;">{esc(value_str)}</div>',
+        f'<div style="font-size:0.7rem;color:rgba(49,51,63,0.6);line-height:1.1;">{esc(label)}</div>'
+        f'<div style="font-size:20px;font-weight:700;color:{color};line-height:1.2;">{esc(value_str)}</div>',
         unsafe_allow_html=True,
     )
-def _metric_group(title, invest, profit, pct):
+def _metric_group(title, invest, profit, pct, theme_color):
     st.markdown(
-        f'<div style="font-weight:700;font-size:0.8rem;margin-top:2px;margin-bottom:2px;">{esc(title)}</div>',
+        f'<div style="font-weight:700;font-size:0.85rem;margin-top:2px;margin-bottom:2px;color:{theme_color};">{esc(title)}</div>',
         unsafe_allow_html=True,
     )
     g1, g2, g3 = st.columns(3)
     with g1:
-        _metric_block("Invest", f"₹{invest:,.0f}")
+        _metric_block("Invest", f"₹{invest:,.0f}", neutral_color=theme_color)
     with g2:
-        _metric_block("Profit", f"₹{profit:,.0f}", profit)
+        _metric_block("Profit", f"₹{profit:,.0f}", profit, neutral_color=theme_color)
     with g3:
-        _metric_block("Profit %", f"{pct:.1f}%", pct)
-_metric_group("Closed Legs", closed_invest, closed_profit, closed_pct)
-_metric_group("Open Legs", open_invest, open_profit, open_pct)
-_metric_group("Total", total_invest, total_profit, overall_pct)
+        _metric_block("Profit %", f"{pct:.1f}%", pct, neutral_color=theme_color)
+_metric_group("Closed Legs", closed_invest, closed_profit, closed_pct, '#1f6feb')
+_metric_group("Open Legs", open_invest, open_profit, open_pct, '#e67e22')
+_metric_group("Total", total_invest, total_profit, overall_pct, '#6f42c1')
 # ------------------------------------------------------------
 # Interactive table — every column header is clickable to sort (click
 # again to reverse), plus an instant search box. Both run entirely in
