@@ -44,6 +44,7 @@ st.markdown("""
 TOKEN_FILE = os.path.join(DATA_DIR, 'token.json')
 LTP_CACHE_FILE = os.path.join(DATA_DIR, 'ltp_cache.json')
 TELEGRAM_CONFIG_FILE = os.path.join(DATA_DIR, 'telegram_config.json')
+AUTO_REFRESH_CONFIG_FILE = os.path.join(DATA_DIR, 'auto_refresh_config.json')
 NSE_JSON_PATH = 'NSE.json'
 # ============================================================
 # Token
@@ -62,6 +63,29 @@ def save_token(token):
     try:
         with open(TOKEN_FILE, 'w') as f:
             json.dump({'date': get_ist_now().strftime('%Y-%m-%d'), 'token': token}, f)
+    except Exception:
+        pass
+# ============================================================
+# Auto-refresh settings — persisted to disk (not just widget state).
+# The auto-refresh mechanism itself works by a browser reload (see the
+# bottom of render_pnl_tab), and a full reload starts a brand-new
+# Streamlit session with every widget back at its default — so without
+# this, "Enable Auto-Refresh" would silently switch itself back off
+# after the very first refresh. Saving/restoring it from disk is what
+# makes it actually keep auto-refreshing across reloads.
+# ============================================================
+def load_auto_refresh_config():
+    if os.path.exists(AUTO_REFRESH_CONFIG_FILE):
+        try:
+            with open(AUTO_REFRESH_CONFIG_FILE, 'r') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {'enabled': False, 'interval_min': 1}
+def save_auto_refresh_config(cfg):
+    try:
+        with open(AUTO_REFRESH_CONFIG_FILE, 'w') as f:
+            json.dump(cfg, f)
     except Exception:
         pass
 # ============================================================
@@ -303,8 +327,14 @@ with st.sidebar:
     st.markdown("---")
     st.header("Refresh")
     st.caption("Manual refresh button is at the top of the PNL tab.")
-    auto_refresh = st.checkbox("Enable Auto-Refresh", value=False)
-    refresh_interval_min = st.slider("Refresh Interval (minutes)", min_value=1, max_value=60, value=1)
+    ar_cfg = load_auto_refresh_config()
+    auto_refresh = st.checkbox("Enable Auto-Refresh", value=ar_cfg.get('enabled', False))
+    refresh_interval_min = st.slider(
+        "Refresh Interval (minutes)", min_value=1, max_value=60,
+        value=int(ar_cfg.get('interval_min', 1))
+    )
+    if (auto_refresh, refresh_interval_min) != (ar_cfg.get('enabled', False), ar_cfg.get('interval_min', 1)):
+        save_auto_refresh_config({'enabled': auto_refresh, 'interval_min': refresh_interval_min})
     st.markdown("---")
     if st.button("🔧 Re-resolve missing contract keys", use_container_width=True):
         today_str = get_ist_now().strftime('%Y-%m-%d')
@@ -1020,79 +1050,78 @@ def render_pnl_tab():
 # ============================================================
 def render_calculator_tab():
     st.subheader("What-If PNL Calculator")
-    st.caption("Nothing here is saved — enter numbers and the result updates instantly, just like a quick Excel sheet.")
+    st.caption("Nothing here is saved — enter numbers and the result updates instantly, just like a quick Excel sheet. Target IS the exit price used for the calculation.")
     if st.button("🔄 Reset Calculator"):
         for k in (
-            "calc_lot_size", "calc_ce_strike", "calc_ce_entry", "calc_ce_qty", "calc_ce_tgt", "calc_ce_exit",
-            "calc_pe_strike", "calc_pe_entry", "calc_pe_qty", "calc_pe_tgt", "calc_pe_exit",
+            "calc_lot_size", "calc_ce_entry", "calc_ce_qty", "calc_ce_tgt",
+            "calc_pe_entry", "calc_pe_qty", "calc_pe_tgt",
         ):
             st.session_state.pop(k, None)
         st.rerun()
     lot_size_calc = st.number_input("Lot Size", min_value=1, step=1, value=1, key="calc_lot_size")
     leg_header("CE Leg", **CE_COLORS)
-    cc1, cc2, cc3, cc4, cc5 = st.columns(5)
-    ce_strike_c = cc1.number_input("CE Strike", min_value=0.0, step=0.5, format="%.1f", key="calc_ce_strike")
-    ce_entry_c = cc2.number_input("CE Entry", min_value=0.0, step=0.05, format="%.2f", key="calc_ce_entry")
-    ce_qty_c = cc3.number_input("CE Qty", min_value=1, step=1, value=1, key="calc_ce_qty")
-    ce_tgt_c = cc4.number_input("CE Target", min_value=0.0, step=0.05, format="%.2f", key="calc_ce_tgt")
-    ce_exit_c = cc5.number_input("CE Exit (what-if)", min_value=0.0, step=0.05, format="%.2f", key="calc_ce_exit")
+    cc1, cc2, cc3 = st.columns(3)
+    ce_entry_c = cc1.number_input("CE Entry", min_value=0.0, step=0.05, format="%.2f", key="calc_ce_entry")
+    ce_qty_c = cc2.number_input("CE Qty", min_value=1, step=1, value=1, key="calc_ce_qty")
+    ce_tgt_c = cc3.number_input("CE Target (= Exit)", min_value=0.0, step=0.05, format="%.2f", key="calc_ce_tgt")
     leg_header("PE Leg", **PE_COLORS)
-    pp1, pp2, pp3, pp4, pp5 = st.columns(5)
-    pe_strike_c = pp1.number_input("PE Strike", min_value=0.0, step=0.5, format="%.1f", key="calc_pe_strike")
-    pe_entry_c = pp2.number_input("PE Entry", min_value=0.0, step=0.05, format="%.2f", key="calc_pe_entry")
-    pe_qty_c = pp3.number_input("PE Qty", min_value=1, step=1, value=1, key="calc_pe_qty")
-    pe_tgt_c = pp4.number_input("PE Target", min_value=0.0, step=0.05, format="%.2f", key="calc_pe_tgt")
-    pe_exit_c = pp5.number_input("PE Exit (what-if)", min_value=0.0, step=0.05, format="%.2f", key="calc_pe_exit")
-    def _leg(entry, qty, tgt, exit_):
+    pp1, pp2, pp3 = st.columns(3)
+    pe_entry_c = pp1.number_input("PE Entry", min_value=0.0, step=0.05, format="%.2f", key="calc_pe_entry")
+    pe_qty_c = pp2.number_input("PE Qty", min_value=1, step=1, value=1, key="calc_pe_qty")
+    pe_tgt_c = pp3.number_input("PE Target (= Exit)", min_value=0.0, step=0.05, format="%.2f", key="calc_pe_tgt")
+    def _leg(entry, qty, tgt):
         taken = entry > 0
         if not taken:
-            return {'points': 0.0, 'invest': 0.0, 'profit': 0.0, 'tgt_points': 0.0, 'tgt_profit': 0.0, 'taken': False}
-        points = (exit_ - entry) * qty if exit_ > 0 else 0.0
+            return {'points': 0.0, 'invest': 0.0, 'profit': 0.0, 'taken': False}
+        points = (tgt - entry) * qty if tgt > 0 else 0.0
         invest = entry * lot_size_calc * qty
         profit = points * lot_size_calc
-        tgt_points = (tgt - entry) * qty if tgt > 0 else 0.0
-        tgt_profit = tgt_points * lot_size_calc
-        return {'points': points, 'invest': invest, 'profit': profit, 'tgt_points': tgt_points, 'tgt_profit': tgt_profit, 'taken': True}
-    ce_r = _leg(ce_entry_c, ce_qty_c, ce_tgt_c, ce_exit_c)
-    pe_r = _leg(pe_entry_c, pe_qty_c, pe_tgt_c, pe_exit_c)
+        return {'points': points, 'invest': invest, 'profit': profit, 'taken': True}
+    ce_r = _leg(ce_entry_c, ce_qty_c, ce_tgt_c)
+    pe_r = _leg(pe_entry_c, pe_qty_c, pe_tgt_c)
     net_invest = ce_r['invest'] + pe_r['invest']
     net_profit = ce_r['profit'] + pe_r['profit']
     net_pct = (net_profit / net_invest * 100) if net_invest else 0.0
-    net_tgt_points = ce_r['tgt_points'] + pe_r['tgt_points']
-    net_tgt_profit = net_tgt_points * lot_size_calc
-    tgt_pct = (net_tgt_profit / net_invest * 100) if net_invest else 0.0
+    # Result shown FIRST, table below it.
     st.markdown("---")
-    def _row(label, r, strike, exit_val, tgt_val, bg):
-        exit_disp = f"{exit_val:.2f}" if r['taken'] and exit_val > 0 else "—"
+    r1, r2, r3 = st.columns(3)
+    with r1:
+        metric_block("Net Invest", f"₹{net_invest:,.0f}")
+    with r2:
+        metric_block("Net Profit", f"₹{net_profit:,.0f}", net_profit)
+    with r3:
+        metric_block("Profit %", f"{net_pct:.1f}%", net_pct)
+    st.write("")
+    def _row(label, r, entry_val, qty_val, tgt_val, bg):
+        entry_disp = f"{entry_val:.2f}" if r['taken'] else "—"
+        qty_disp = f"{qty_val}" if r['taken'] else "—"
         tgt_disp = f"{tgt_val:.2f}" if r['taken'] and tgt_val > 0 else "—"
         pts_style = pnl_style(r['points']) if r['taken'] else ''
         profit_style = pnl_style(r['profit']) if r['taken'] else ''
         return (
             f'<tr style="background:{bg};">'
             f'<td style="font-weight:700;padding:6px 10px;border:1px solid #d0d0d0;">{esc(label)}</td>'
-            f'<td style="padding:6px 10px;border:1px solid #d0d0d0;text-align:center;">{strike:.1f}</td>'
-            f'<td style="padding:6px 10px;border:1px solid #d0d0d0;text-align:center;">{exit_disp}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #d0d0d0;text-align:center;">{entry_disp}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #d0d0d0;text-align:center;">{qty_disp}</td>'
+            f'<td style="padding:6px 10px;border:1px solid #d0d0d0;text-align:center;">{tgt_disp}</td>'
             f'<td style="padding:6px 10px;border:1px solid #d0d0d0;text-align:center;{pts_style}">{r["points"]:.2f}</td>'
             f'<td style="padding:6px 10px;border:1px solid #d0d0d0;text-align:center;">{r["invest"]:,.0f}</td>'
             f'<td style="padding:6px 10px;border:1px solid #d0d0d0;text-align:center;{profit_style}">{r["profit"]:,.0f}</td>'
-            f'<td style="padding:6px 10px;border:1px solid #d0d0d0;text-align:center;">{tgt_disp}</td>'
-            f'<td style="padding:6px 10px;border:1px solid #d0d0d0;text-align:center;">{r["tgt_points"]:.2f}</td>'
             f'</tr>'
         )
     net_profit_style = pnl_style(net_profit)
     rows_html = (
-        _row("CE", ce_r, ce_strike_c, ce_exit_c, ce_tgt_c, CE_COLORS['bg'])
-        + _row("PE", pe_r, pe_strike_c, pe_exit_c, pe_tgt_c, PE_COLORS['bg'])
+        _row("CE", ce_r, ce_entry_c, ce_qty_c, ce_tgt_c, CE_COLORS['bg'])
+        + _row("PE", pe_r, pe_entry_c, pe_qty_c, pe_tgt_c, PE_COLORS['bg'])
         + (
             f'<tr style="background:#eeeeee;font-weight:700;">'
             f'<td style="padding:6px 10px;border:1px solid #d0d0d0;">NET</td>'
             f'<td style="padding:6px 10px;border:1px solid #d0d0d0;text-align:center;">—</td>'
             f'<td style="padding:6px 10px;border:1px solid #d0d0d0;text-align:center;">—</td>'
             f'<td style="padding:6px 10px;border:1px solid #d0d0d0;text-align:center;">—</td>'
+            f'<td style="padding:6px 10px;border:1px solid #d0d0d0;text-align:center;">—</td>'
             f'<td style="padding:6px 10px;border:1px solid #d0d0d0;text-align:center;">{net_invest:,.0f}</td>'
             f'<td style="padding:6px 10px;border:1px solid #d0d0d0;text-align:center;{net_profit_style}">{net_profit:,.0f}</td>'
-            f'<td style="padding:6px 10px;border:1px solid #d0d0d0;text-align:center;">—</td>'
-            f'<td style="padding:6px 10px;border:1px solid #d0d0d0;text-align:center;">{net_tgt_points:.2f}</td>'
             f'</tr>'
         )
     )
@@ -1101,32 +1130,18 @@ def render_calculator_tab():
     <table style="border-collapse:collapse;width:100%;font-size:14px;">
     <thead><tr style="background:#f4a261;color:#1a1a1a;">
     <th style="padding:6px 10px;border:1px solid #d0d0d0;">Leg</th>
-    <th style="padding:6px 10px;border:1px solid #d0d0d0;">Strike</th>
-    <th style="padding:6px 10px;border:1px solid #d0d0d0;">Exit</th>
+    <th style="padding:6px 10px;border:1px solid #d0d0d0;">Entry</th>
+    <th style="padding:6px 10px;border:1px solid #d0d0d0;">Qty</th>
+    <th style="padding:6px 10px;border:1px solid #d0d0d0;">Target (Exit)</th>
     <th style="padding:6px 10px;border:1px solid #d0d0d0;">Points</th>
     <th style="padding:6px 10px;border:1px solid #d0d0d0;">Invest</th>
     <th style="padding:6px 10px;border:1px solid #d0d0d0;">Profit</th>
-    <th style="padding:6px 10px;border:1px solid #d0d0d0;">Target</th>
-    <th style="padding:6px 10px;border:1px solid #d0d0d0;">TGT Points</th>
     </tr></thead>
     <tbody>{rows_html}</tbody>
     </table>
     </div>
     """
     st.markdown(table_html, unsafe_allow_html=True)
-    st.write("")
-    m1, m2, m3 = st.columns(3)
-    with m1:
-        metric_block("Net Invest", f"₹{net_invest:,.0f}")
-    with m2:
-        metric_block("Net Profit", f"₹{net_profit:,.0f}", net_profit)
-    with m3:
-        metric_block("Profit %", f"{net_pct:.1f}%", net_pct)
-    m4, m5 = st.columns(2)
-    with m4:
-        metric_block("Net TGT Points", f"{net_tgt_points:.2f}")
-    with m5:
-        metric_block("TGT %", f"{tgt_pct:.1f}%", tgt_pct)
 # ============================================================
 # Main page — PNL first, Calculator next (tabs, not separate pages)
 # ============================================================
