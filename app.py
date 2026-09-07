@@ -11,12 +11,10 @@ import concurrent.futures
 import html as html_lib
 import io
 from datetime import datetime
-
 from storage import (
     get_ist_now, DATA_DIR, PERSISTENCE_CONFIGURED,
     load_positions, save_positions, next_sno, esc, pnl_style,
 )
-
 # ============================================================
 # SIMPLE BY DESIGN
 #
@@ -33,7 +31,6 @@ from storage import (
 # instructions live in storage.py.
 # ============================================================
 st.set_page_config(page_title="PNL Tracker", page_icon="📈", layout="wide")
-
 st.markdown("""
     <style>
         .block-container { padding-top: 1rem !important; padding-bottom: 1rem !important; }
@@ -41,13 +38,10 @@ st.markdown("""
         div[data-testid="stDataFrame"] { font-weight: 600 !important; }
     </style>
 """, unsafe_allow_html=True)
-
 TOKEN_FILE = os.path.join(DATA_DIR, 'token.json')
 LTP_CACHE_FILE = os.path.join(DATA_DIR, 'ltp_cache.json')
 TELEGRAM_CONFIG_FILE = os.path.join(DATA_DIR, 'telegram_config.json')
 NSE_JSON_PATH = 'NSE.json'
-
-
 # ============================================================
 # Token
 # ============================================================
@@ -61,16 +55,12 @@ def load_token():
         except Exception:
             pass
     return ''
-
-
 def save_token(token):
     try:
         with open(TOKEN_FILE, 'w') as f:
             json.dump({'date': get_ist_now().strftime('%Y-%m-%d'), 'token': token}, f)
     except Exception:
         pass
-
-
 # ============================================================
 # Telegram alerts
 # ============================================================
@@ -82,16 +72,12 @@ def load_telegram_config():
         except Exception:
             pass
     return {'bot_token': '', 'chat_id': '', 'enabled': False}
-
-
 def save_telegram_config(cfg):
     try:
         with open(TELEGRAM_CONFIG_FILE, 'w') as f:
             json.dump(cfg, f)
     except Exception:
         pass
-
-
 def send_telegram_message(bot_token, chat_id, text):
     if not bot_token or not chat_id:
         return False, "Bot Token / Chat ID missing"
@@ -103,8 +89,6 @@ def send_telegram_message(bot_token, chat_id, text):
         return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
     except Exception as e:
         return False, str(e)
-
-
 # ============================================================
 # LTP cache + fetch
 # ============================================================
@@ -116,8 +100,6 @@ def load_ltp_cache():
         except Exception:
             pass
     return {}
-
-
 def save_ltp_cache(new_data):
     try:
         cache = load_ltp_cache()
@@ -126,8 +108,6 @@ def save_ltp_cache(new_data):
             json.dump(cache, f)
     except Exception:
         pass
-
-
 def fetch_ltp(instrument_keys, token):
     if not token or not instrument_keys:
         return {}
@@ -136,7 +116,6 @@ def fetch_ltp(instrument_keys, token):
     batch_size = 50
     ltp_map = {}
     batches = [instrument_keys[i:i + batch_size] for i in range(0, len(instrument_keys), batch_size)]
-
     def fetch_batch(batch):
         params = {'instrument_key': ','.join(batch)}
         try:
@@ -154,7 +133,6 @@ def fetch_ltp(instrument_keys, token):
         except Exception:
             pass
         return {}
-
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         futures = [executor.submit(fetch_batch, b) for b in batches]
         for future in concurrent.futures.as_completed(futures):
@@ -165,8 +143,6 @@ def fetch_ltp(instrument_keys, token):
             except Exception:
                 pass
     return ltp_map
-
-
 # ============================================================
 # NSE instrument master — only needed when OPENING a new position
 # (to resolve instrument_key + lot_size for the current expiry).
@@ -185,8 +161,6 @@ def load_nse_json():
     except Exception as e:
         st.error(f"Error loading NSE.json: {e}")
         return pd.DataFrame()
-
-
 @st.cache_data(show_spinner=False, ttl=300)
 def resolve_current_contract(symbol, strike, option_type, today_str):
     """
@@ -215,8 +189,6 @@ def resolve_current_contract(symbol, strike, option_type, today_str):
     expiry_dt = row.get('expiry_dt')
     expiry_str = expiry_dt.strftime('%Y-%m-%d') if pd.notna(expiry_dt) else None
     return inst_key, lot_size, expiry_str
-
-
 # ============================================================
 # Sidebar
 # ============================================================
@@ -232,13 +204,11 @@ with st.sidebar:
         )
     else:
         st.success("✅ Durable storage active (GitHub Gist). Positions survive app restarts.")
-
     st.header("Configuration")
     saved_token = load_token()
     access_token = st.text_input("Upstox Access Token", value=saved_token, type="password")
     if access_token and access_token != saved_token:
         save_token(access_token)
-
     st.markdown("---")
     st.subheader("NSE Instrument JSON")
     st.caption(f"{'✅ Found' if os.path.exists(NSE_JSON_PATH) else '❌ Missing'}: {NSE_JSON_PATH} (needed only to open new positions)")
@@ -260,7 +230,6 @@ with st.sidebar:
                     st.error(f"Download failed: HTTP {response.status_code}")
         except Exception as e:
             st.error(f"Error: {e}")
-
     st.markdown("---")
     st.header("Telegram Alerts")
     tg_cfg = load_telegram_config()
@@ -275,12 +244,11 @@ with st.sidebar:
     if st.button("Send Test Message", use_container_width=True):
         ok, msg = send_telegram_message(tg_bot_token, tg_chat_id, "✅ Hedge PNL Tracker: test alert.")
         st.success("Sent.") if ok else st.error(f"Failed: {msg}")
-
     st.markdown("---")
-    st.header("Auto Refresh")
+    st.header("Refresh")
+    manual_refresh_clicked = st.button("🔄 Refresh Now", use_container_width=True)
     auto_refresh = st.checkbox("Enable Auto-Refresh", value=False)
-    refresh_interval = st.slider("Refresh Interval (seconds)", min_value=5, max_value=60, value=15)
-
+    refresh_interval_min = st.slider("Refresh Interval (minutes)", min_value=1, max_value=60, value=1)
     st.markdown("---")
     if st.button("🔧 Re-resolve missing contract keys", use_container_width=True):
         today_str = get_ist_now().strftime('%Y-%m-%d')
@@ -306,14 +274,11 @@ with st.sidebar:
             st.rerun()
         else:
             st.info("Nothing to fix — download NSE.json first if keys are still missing.")
-
 # ============================================================
 # Main page
 # ============================================================
 st.title("PNL Tracker")
-
 positions = load_positions()
-
 # ------------------------------------------------------------
 # Open a new position
 # ------------------------------------------------------------
@@ -323,25 +288,20 @@ with st.expander("➕ Add Position", expanded=(len(positions) == 0)):
         c1, c2 = st.columns(2)
         entry_date = c1.date_input("Entry Date", value=get_ist_now().date())
         symbol = c2.text_input("Symbol", placeholder="e.g. KOTAKBANK").strip().upper()
-
         st.markdown("**CE leg**")
         ce1, ce2, ce3, ce4 = st.columns(4)
         ce_strike = ce1.number_input("CE Strike", min_value=0.0, step=0.5, format="%.1f", key="ce_strike")
         ce_entry = ce2.number_input("CE Entry", min_value=0.0, step=0.05, format="%.2f", key="ce_entry")
         ce_tgt = ce3.number_input("CE TGT", min_value=0.0, step=0.05, format="%.2f", key="ce_tgt")
         ce_qty = ce4.number_input("CE Qty", min_value=1, step=1, value=1, key="ce_qty")
-
         st.markdown("**PE leg**")
         pe1, pe2, pe3, pe4 = st.columns(4)
         pe_strike = pe1.number_input("PE Strike", min_value=0.0, step=0.5, format="%.1f", key="pe_strike")
         pe_entry = pe2.number_input("PE Entry", min_value=0.0, step=0.05, format="%.2f", key="pe_entry")
         pe_tgt = pe3.number_input("PE TGT", min_value=0.0, step=0.05, format="%.2f", key="pe_tgt")
         pe_qty = pe4.number_input("PE Qty", min_value=1, step=1, value=1, key="pe_qty")
-
         remarks = st.text_input("Remarks", value="")
-
         submitted = st.form_submit_button("Add Position", use_container_width=True)
-
         if submitted:
             # A leg only counts as "taken" if it has an entry price. Some
             # hedges are CE-only or PE-only — a leg with entry left at 0 is
@@ -398,11 +358,9 @@ with st.expander("➕ Add Position", expanded=(len(positions) == 0)):
                 save_positions(positions)
                 st.success(f"Added S.no {new_pos['sno']} — {symbol}")
                 st.rerun()
-
 if not positions:
     st.info("No positions yet. Use **Add Position** above to open your first hedge, or **Restore from Excel Backup** in the sidebar.")
     st.stop()
-
 # ------------------------------------------------------------
 # Live LTP for every open leg
 # ------------------------------------------------------------
@@ -415,7 +373,7 @@ if access_token and all_keys:
     ist_now = get_ist_now()
     is_market_hours = datetime.strptime("09:00", "%H:%M").time() <= ist_now.time() <= datetime.strptime("15:40", "%H:%M").time()
     missing_keys = [k for k in all_keys if k not in ltp_cache]
-    keys_to_fetch = all_keys if is_market_hours else missing_keys
+    keys_to_fetch = all_keys if (is_market_hours or manual_refresh_clicked) else missing_keys
     if keys_to_fetch:
         fetched = fetch_ltp(keys_to_fetch, access_token)
         if fetched:
@@ -423,12 +381,8 @@ if access_token and all_keys:
             ltp_cache = load_ltp_cache()
 elif not access_token:
     st.warning("Enter your Upstox Access Token in the sidebar to see live LTP.")
-
-
 def leg_ltp(inst_key):
     return float(ltp_cache.get(inst_key, 0.0)) if inst_key else 0.0
-
-
 # ------------------------------------------------------------
 # Build the display table — spreadsheet-style: one row PER LEG (CE, PE)
 # like the original Excel sheet, with the shared fields (S.no, Entry
@@ -443,10 +397,13 @@ def leg_ltp(inst_key):
 open_legs = 0
 total_invest = 0.0
 total_profit = 0.0
+closed_invest = 0.0
+closed_profit = 0.0
+open_invest = 0.0
+open_profit = 0.0
 alerts_changed = False
 alert_failures = []
 enriched = []  # one entry per position, computed once, then filtered/sorted/rendered
-
 for p in positions:
     lot = p.get('lot_size') or 0
     leg_calc = {}
@@ -484,7 +441,6 @@ for p in positions:
             'profit': profit, 'tgt_profit': tgt_profit, 'is_open': is_open,
             'tgt_hit': tgt > 0 and is_open and ltp >= tgt, 'taken': True,
         }
-
     net_invest = leg_calc['ce']['invest'] + leg_calc['pe']['invest']
     net_profit = leg_calc['ce']['profit'] + leg_calc['pe']['profit']
     if net_profit == 0:
@@ -493,11 +449,22 @@ for p in positions:
     net_tgt_profit = leg_calc['ce']['tgt_profit'] + leg_calc['pe']['tgt_profit']
     tgt_pct = (net_tgt_profit / net_invest * 100) if net_invest else 0.0
     pos_open_legs = int(leg_calc['ce']['is_open']) + int(leg_calc['pe']['is_open'])
-
     open_legs += pos_open_legs
     total_invest += net_invest
     total_profit += net_profit
-
+    # Split invest/profit into closed-leg vs open-leg buckets — a single
+    # position can have one leg closed and the other still open, so this
+    # is tallied per leg, not per position.
+    for leg in ('ce', 'pe'):
+        lc = leg_calc[leg]
+        if not lc['taken']:
+            continue
+        if lc['is_open']:
+            open_invest += lc['invest']
+            open_profit += lc['profit']
+        else:
+            closed_invest += lc['invest']
+            closed_profit += lc['profit']
     # --- Telegram alerts: TGT hit / profit% >= 50 / profit% <= -30 ---
     # Only actually fires (and only then marks itself "consumed") once
     # Alerts are enabled — leaving alerts off never burns an alert flag,
@@ -538,12 +505,10 @@ for p in positions:
                     alert_failures.append(msg)
                 p['loss30_alerted'] = True
                 alerts_changed = True
-
     entry_date_parsed = pd.to_datetime(p.get('entry_date'), errors='coerce')
     exit_date_parsed = pd.to_datetime(p.get('exit_date'), errors='coerce')
     entry_date_str = entry_date_parsed.strftime('%d-%m-%Y') if pd.notna(entry_date_parsed) else '—'
     exit_date_str = exit_date_parsed.strftime('%d-%m-%Y') if pd.notna(exit_date_parsed) else '—'
-
     enriched.append({
         'p': p, 'leg_calc': leg_calc,
         'net_invest': net_invest, 'net_profit': net_profit, 'net_pct': net_pct,
@@ -552,14 +517,13 @@ for p in positions:
         'entry_date_str': entry_date_str, 'exit_date_str': exit_date_str,
         'entry_date_sort': entry_date_parsed, 'exit_date_sort': exit_date_parsed,
     })
-
 overall_pct = (total_profit / total_invest * 100) if total_invest else 0.0
-
+closed_pct = (closed_profit / closed_invest * 100) if closed_invest else 0.0
+open_pct = (open_profit / open_invest * 100) if open_invest else 0.0
 if alerts_changed:
     save_positions(positions)
 if alert_failures:
     st.warning("Telegram alert failed to send: " + "; ".join(alert_failures[:3]))
-
 def _colored_metric(label, value_str, val):
     color = '#0b6623' if val > 0 else ('#c0392b' if val < 0 else 'inherit')
     st.markdown(
@@ -567,16 +531,27 @@ def _colored_metric(label, value_str, val):
         f'<div style="font-size:2.25rem;font-weight:600;color:{color};line-height:1.3;">{esc(value_str)}</div>',
         unsafe_allow_html=True,
     )
-
-
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Open Legs", open_legs)
-m2.metric("Total Invested", f"₹{total_invest:,.0f}")
-with m3:
-    _colored_metric("Total Net Profit", f"₹{total_profit:,.0f}", total_profit)
-with m4:
-    _colored_metric("Overall PNL %", f"{overall_pct:.1f}%", overall_pct)
-
+st.markdown("**Closed Legs**")
+cc1, cc2, cc3 = st.columns(3)
+cc1.metric("Invest", f"₹{closed_invest:,.0f}")
+with cc2:
+    _colored_metric("Profit", f"₹{closed_profit:,.0f}", closed_profit)
+with cc3:
+    _colored_metric("Profit %", f"{closed_pct:.1f}%", closed_pct)
+st.markdown("**Open Legs**")
+oo1, oo2, oo3 = st.columns(3)
+oo1.metric("Invest", f"₹{open_invest:,.0f}")
+with oo2:
+    _colored_metric("Profit", f"₹{open_profit:,.0f}", open_profit)
+with oo3:
+    _colored_metric("Profit %", f"{open_pct:.1f}%", open_pct)
+st.markdown("**Total**")
+tt1, tt2, tt3 = st.columns(3)
+tt1.metric("Invest", f"₹{total_invest:,.0f}")
+with tt2:
+    _colored_metric("Profit", f"₹{total_profit:,.0f}", total_profit)
+with tt3:
+    _colored_metric("Profit %", f"{overall_pct:.1f}%", overall_pct)
 # ------------------------------------------------------------
 # Interactive table — every column header is clickable to sort (click
 # again to reverse), plus an instant search box. Both run entirely in
@@ -612,12 +587,8 @@ def _leg_row_dict(p, lot, leg, lc, entry_date_str, exit_date_str, net_invest, ne
         'profit%': round(net_pct, 2), 'TGT %': round(tgt_pct, 2), 'Exit Date': exit_date_str,
         'remarks': p.get('remarks') or '',
     }
-
-
 def _ts_ms(ts):
     return int(ts.timestamp() * 1000) if pd.notna(ts) else None
-
-
 TABLE_COLUMNS = [
     ("S.no", "sno", None),
     ("Entry Date", "entry_date", None),
@@ -639,14 +610,12 @@ TABLE_COLUMNS = [
     ("Exit Date", "exit_date", None),
     ("remarks", "remarks", None),
 ]
-
 # Fixed initial order in the DOM: open positions first (by S.no), then
 # closed (by S.no). The script re-sorts client-side from here, but always
 # re-applies this same open-before-closed grouping after every click.
 initial_open = sorted((e for e in enriched if e['is_open']), key=lambda e: e['p']['sno'])
 initial_closed = sorted((e for e in enriched if not e['is_open']), key=lambda e: e['p']['sno'])
 initial_order = initial_open + initial_closed
-
 body_blocks_html = []
 for pos_idx, e in enumerate(initial_order):
     p, leg_calc = e['p'], e['leg_calc']
@@ -655,7 +624,6 @@ for pos_idx, e in enumerate(initial_order):
     entry_date_str, exit_date_str = e['entry_date_str'], e['exit_date_str']
     lot = p.get('lot_size') or 0
     ce = leg_calc['ce']
-
     sort_vals = {
         'sno': p['sno'],
         'entry_date': _ts_ms(e['entry_date_sort']),
@@ -678,7 +646,6 @@ for pos_idx, e in enumerate(initial_order):
         'ce_profit': round(ce['profit'], 2),
     }
     vals_attr = html_lib.escape(json.dumps(sort_vals), quote=True)
-
     # Closed positions get their ENTIRE row colored by outcome (green =
     # profit, red = loss) instead of the usual alternating white/grey
     # banding — a closed position is done, so its row should read as a
@@ -691,7 +658,6 @@ for pos_idx, e in enumerate(initial_order):
         elif net_profit < 0:
             closed_class = 'row-closed-loss'
     band = closed_class or ('row-band-b' if pos_idx % 2 else 'row-band-a')
-
     rows = []
     for i, leg in enumerate(('ce', 'pe')):
         lc = leg_calc[leg]
@@ -703,7 +669,6 @@ for pos_idx, e in enumerate(initial_order):
         profit_style = '' if closed_class else pnl_style(lc["profit"])
         net_profit_style = '' if closed_class else pnl_style(net_profit)
         exit_disp = f"{lc['exit']:.2f}" if lc['exit'] is not None else '—'
-
         cells = []
         if i == 0:
             cells.append(f'<td rowspan="2" class="{band}">{p["sno"]}</td>')
@@ -733,17 +698,14 @@ for pos_idx, e in enumerate(initial_order):
             cells.append(f'<td rowspan="2" class="{band}">{exit_date_str}</td>')
             cells.append(f'<td rowspan="2" class="{band}">{esc(p.get("remarks") or "")}</td>')
         rows.append('<tr>' + ''.join(cells) + '</tr>')
-
     body_blocks_html.append(
         f'<tbody data-open="{1 if e["is_open"] else 0}" data-vals="{vals_attr}">'
         + ''.join(rows) + '</tbody>'
     )
-
 header_cells = []
 for label, key, tooltip in TABLE_COLUMNS:
     title_attr = f' title="{esc(tooltip)}"' if tooltip else ''
     header_cells.append(f'<th data-key="{key}" data-label="{esc(label)}"{title_attr}>{esc(label)}</th>')
-
 # Excel export — deliberately covers EVERY position regardless of the
 # on-screen search box, so "Download as Excel" always stays a full
 # backup no matter what's currently filtered/sorted on screen. (This
@@ -758,9 +720,7 @@ for e in initial_order:
             p, lot, leg, leg_calc[leg], e['entry_date_str'], e['exit_date_str'],
             e['net_invest'], e['net_profit'], e['net_pct'], e['tgt_pct']
         ))
-
 st.caption(f"Last Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
-
 table_page_html = f"""
 <style>
     body {{ margin:0; font-family: "Source Sans Pro", sans-serif; }}
@@ -787,7 +747,6 @@ table_page_html = f"""
     table.pnl-table .exit-cell {{ background-color: #ffeb9c; font-weight: 600; }}
     #noMatch {{ padding: 10px; color: #555; font-style: italic; display: none; }}
 </style>
-
 <input id="searchBox" type="text" placeholder="🔍 Search S.no, symbol or remarks..." />
 <div class="pnl-table-wrap">
 <table class="pnl-table" id="pnlTable">
@@ -800,19 +759,16 @@ table_page_html = f"""
 </table>
 </div>
 <div id="noMatch">No positions match your search.</div>
-
 <script>
 (function() {{
     var table = document.getElementById('pnlTable');
     var currentSort = {{ key: null, dir: 1 }};
-
     function cmp(a, b) {{
         if (a === null || a === undefined) a = -Infinity;
         if (b === null || b === undefined) b = -Infinity;
         if (typeof a === 'string' && typeof b === 'string') return a.localeCompare(b);
         return a - b;
     }}
-
     function applySort(key) {{
         if (currentSort.key === key) {{ currentSort.dir *= -1; }} else {{ currentSort = {{ key: key, dir: 1 }}; }}
         var bodies = Array.from(table.querySelectorAll('tbody'));
@@ -828,11 +784,9 @@ table_page_html = f"""
             th.textContent = (th.dataset.key === key) ? (base + (currentSort.dir === 1 ? ' \\u25B2' : ' \\u25BC')) : base;
         }});
     }}
-
     document.querySelectorAll('th[data-key]').forEach(function(th) {{
         th.addEventListener('click', function() {{ applySort(th.dataset.key); }});
     }});
-
     document.getElementById('searchBox').addEventListener('input', function() {{
         var term = this.value.trim().toUpperCase();
         var visible = 0;
@@ -848,14 +802,11 @@ table_page_html = f"""
 }})();
 </script>
 """
-
 components.html(table_page_html, height=1130, scrolling=True)
-
 # ------------------------------------------------------------
 # Excel download + clear-all
 # ------------------------------------------------------------
 dl_col, clear_col = st.columns(2)
-
 with dl_col:
     export_buf = io.BytesIO()
     pd.DataFrame(export_rows).to_excel(export_buf, index=False, sheet_name='Positions', engine='openpyxl')
@@ -866,7 +817,6 @@ with dl_col:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
-
 with clear_col:
     with st.popover("🗑️ Clear All Positions", use_container_width=True):
         st.warning("This deletes every position permanently. This cannot be undone.")
@@ -876,7 +826,6 @@ with clear_col:
             st.success("Cleared.")
             time.sleep(1)
             st.rerun()
-
 # ------------------------------------------------------------
 # Close / edit a position — plain widgets, no grid editing. Collapsed
 # by default (like Add Position) so the table above gets the vertical
@@ -887,7 +836,6 @@ with st.expander("✏️ Close / Edit a Position", expanded=False):
     choice = st.selectbox("Position", options=list(options.keys()))
     sel_sno = options[choice]
     pos = next(p for p in positions if p['sno'] == sel_sno)
-
     with st.form("edit_position_form"):
         st.caption("Entry Date & Strikes — fix these here if they were entered wrong")
         d1, d2, d3 = st.columns(3)
@@ -903,7 +851,6 @@ with st.expander("✏️ Close / Edit a Position", expanded=False):
             "PE Strike", min_value=0.0, step=0.5, format="%.1f",
             value=float(pos.get('pe_strike') or 0.0)
         )
-
         st.caption("Entry / Qty")
         e1, e2, e3, e4 = st.columns(4)
         ce_entry_val = e1.number_input(
@@ -922,7 +869,6 @@ with st.expander("✏️ Close / Edit a Position", expanded=False):
             "PE Qty", min_value=1, step=1,
             value=int(pos.get('pe_qty') or 1)
         )
-
         st.caption("TGT")
         t1, t2 = st.columns(2)
         ce_tgt_val = t1.number_input(
@@ -933,7 +879,6 @@ with st.expander("✏️ Close / Edit a Position", expanded=False):
             "PE TGT", min_value=0.0, step=0.05, format="%.2f",
             value=float(pos.get('pe_tgt') or 0.0)
         )
-
         st.caption("Exit")
         c1, c2 = st.columns(2)
         ce_exit_val = c1.number_input(
@@ -949,15 +894,12 @@ with st.expander("✏️ Close / Edit a Position", expanded=False):
             value=pd.to_datetime(pos['exit_date']).date() if pos.get('exit_date') else get_ist_now().date()
         )
         remarks_val = st.text_input("Remarks", value=pos.get('remarks') or '')
-
         save_col, delete_col = st.columns(2)
         save_clicked = save_col.form_submit_button("💾 Save", use_container_width=True)
         delete_clicked = delete_col.form_submit_button("🗑️ Delete Position", use_container_width=True)
-
         if save_clicked:
             original_ce_strike = pos.get('ce_strike') or 0
             original_pe_strike = pos.get('pe_strike') or 0
-
             pos['entry_date'] = str(entry_date_edit_val)
             pos['ce_strike'] = ce_strike_val
             pos['pe_strike'] = pe_strike_val
@@ -971,7 +913,6 @@ with st.expander("✏️ Close / Edit a Position", expanded=False):
             pos['pe_exit'] = pe_exit_val if pe_exit_val > 0 else None
             pos['exit_date'] = str(exit_date_val) if (ce_exit_val > 0 or pe_exit_val > 0) else None
             pos['remarks'] = remarks_val
-
             # A corrected strike means the instrument key resolved earlier
             # is for the WRONG contract and would keep showing that
             # contract's LTP — re-resolve whichever leg's strike actually
@@ -995,20 +936,17 @@ with st.expander("✏️ Close / Edit a Position", expanded=False):
                     pos['expiry'] = pe_expiry
                 if not pe_key:
                     st.warning("Couldn't match the new PE strike to a live contract — download NSE.json first.")
-
             # Numbers changed — let TGT/profit% alerts re-evaluate from scratch.
             for flag in ('ce_tgt_alerted', 'pe_tgt_alerted', 'profit50_alerted', 'loss30_alerted'):
                 pos.pop(flag, None)
             save_positions(positions)
             st.success(f"Saved S.no {sel_sno}")
             st.rerun()
-
         if delete_clicked:
             positions = [p for p in positions if p['sno'] != sel_sno]
             save_positions(positions)
             st.success(f"Deleted S.no {sel_sno}")
             st.rerun()
-
 if auto_refresh:
-    time.sleep(refresh_interval)
+    time.sleep(refresh_interval_min * 60)
     st.rerun()
