@@ -454,6 +454,133 @@ def render_pnl_tab():
         st.info("No positions yet. Use **Add Position** above to open your first hedge, or **Restore from Excel Backup** in the sidebar.")
         return
     # ------------------------------------------------------------
+    # Close / edit a position — plain widgets, no grid editing. Sits right
+    # below Add Position (moved up from the bottom of the page) so opening
+    # and closing a hedge are next to each other instead of a long scroll
+    # apart. CE and PE are grouped into their own colored blocks (same
+    # colors as Add Position) so it's obvious at a glance which fields
+    # belong to which leg.
+    # ------------------------------------------------------------
+    with st.expander("✏️ Close / Edit a Position", expanded=False):
+        options = {f"S.no {p['sno']} — {p['symbol']}": p['sno'] for p in positions}
+        choice = st.selectbox("Position", options=list(options.keys()))
+        sel_sno = options[choice]
+        pos = next(p for p in positions if p['sno'] == sel_sno)
+        with st.form("edit_position_form"):
+            entry_date_edit_val = st.date_input(
+                "Entry Date",
+                value=pd.to_datetime(pos.get('entry_date')).date() if pos.get('entry_date') else get_ist_now().date()
+            )
+            leg_header("CE Leg", **CE_COLORS)
+            d1, d2, d3, d4, d5 = st.columns(5)
+            ce_strike_val = d1.number_input(
+                "CE Strike", min_value=0.0, step=0.5, format="%.1f",
+                value=float(pos.get('ce_strike') or 0.0)
+            )
+            ce_entry_val = d2.number_input(
+                "CE Entry", min_value=0.0, step=0.05, format="%.2f",
+                value=float(pos.get('ce_entry') or 0.0)
+            )
+            ce_qty_val = d3.number_input(
+                "CE Qty", min_value=1, step=1,
+                value=int(pos.get('ce_qty') or 1)
+            )
+            ce_tgt_val = d4.number_input(
+                "CE TGT", min_value=0.0, step=0.05, format="%.2f",
+                value=float(pos.get('ce_tgt') or 0.0)
+            )
+            ce_exit_val = d5.number_input(
+                "CE Exit", min_value=0.0, step=0.05, format="%.2f",
+                value=float(pos.get('ce_exit') or 0.0)
+            )
+            leg_header("PE Leg", **PE_COLORS)
+            e1, e2, e3, e4, e5 = st.columns(5)
+            pe_strike_val = e1.number_input(
+                "PE Strike", min_value=0.0, step=0.5, format="%.1f",
+                value=float(pos.get('pe_strike') or 0.0)
+            )
+            pe_entry_val = e2.number_input(
+                "PE Entry", min_value=0.0, step=0.05, format="%.2f",
+                value=float(pos.get('pe_entry') or 0.0)
+            )
+            pe_qty_val = e3.number_input(
+                "PE Qty", min_value=1, step=1,
+                value=int(pos.get('pe_qty') or 1)
+            )
+            pe_tgt_val = e4.number_input(
+                "PE TGT", min_value=0.0, step=0.05, format="%.2f",
+                value=float(pos.get('pe_tgt') or 0.0)
+            )
+            pe_exit_val = e5.number_input(
+                "PE Exit", min_value=0.0, step=0.05, format="%.2f",
+                value=float(pos.get('pe_exit') or 0.0)
+            )
+            st.markdown("---")
+            exit_date_val = st.date_input(
+                "Exit Date",
+                value=pd.to_datetime(pos['exit_date']).date() if pos.get('exit_date') else get_ist_now().date()
+            )
+            remarks_val = st.text_input("Remarks", value=pos.get('remarks') or '')
+            save_col, delete_col = st.columns(2)
+            save_clicked = save_col.form_submit_button("💾 Save", use_container_width=True)
+            delete_clicked = delete_col.form_submit_button("🗑️ Delete Position", use_container_width=True)
+            if save_clicked:
+                original_ce_strike = pos.get('ce_strike') or 0
+                original_pe_strike = pos.get('pe_strike') or 0
+                pos['entry_date'] = str(entry_date_edit_val)
+                pos['ce_strike'] = ce_strike_val
+                pos['pe_strike'] = pe_strike_val
+                pos['ce_entry'] = ce_entry_val
+                pos['pe_entry'] = pe_entry_val
+                pos['ce_qty'] = int(ce_qty_val)
+                pos['pe_qty'] = int(pe_qty_val)
+                pos['ce_tgt'] = ce_tgt_val
+                pos['pe_tgt'] = pe_tgt_val
+                pos['ce_exit'] = ce_exit_val if ce_exit_val > 0 else None
+                pos['pe_exit'] = pe_exit_val if pe_exit_val > 0 else None
+                pos['exit_date'] = str(exit_date_val) if (ce_exit_val > 0 or pe_exit_val > 0) else None
+                pos['remarks'] = remarks_val
+                # A corrected strike means the instrument key resolved earlier
+                # is for the WRONG contract and would keep showing that
+                # contract's LTP — re-resolve whichever leg's strike actually
+                # changed (only matters for a leg that's actually taken).
+                today_str = get_ist_now().strftime('%Y-%m-%d')
+                if pos['ce_entry'] > 0 and ce_strike_val != original_ce_strike:
+                    ce_key, ce_lot, ce_expiry = resolve_current_contract(pos['symbol'], ce_strike_val, "CE", today_str)
+                    pos['ce_instrument_key'] = ce_key
+                    if ce_lot:
+                        pos['lot_size'] = ce_lot
+                    if ce_expiry:
+                        pos['expiry'] = ce_expiry
+                    if not ce_key:
+                        st.warning("Couldn't match the new CE strike to a live contract — download NSE.json first.")
+                if pos['pe_entry'] > 0 and pe_strike_val != original_pe_strike:
+                    pe_key, pe_lot, pe_expiry = resolve_current_contract(pos['symbol'], pe_strike_val, "PE", today_str)
+                    pos['pe_instrument_key'] = pe_key
+                    if pe_lot and not pos.get('lot_size'):
+                        pos['lot_size'] = pe_lot
+                    if pe_expiry and not pos.get('expiry'):
+                        pos['expiry'] = pe_expiry
+                    if not pe_key:
+                        st.warning("Couldn't match the new PE strike to a live contract — download NSE.json first.")
+                # Numbers changed — let profit%/TGT% alerts re-evaluate today
+                # too (also clear old flag fields from earlier alert designs,
+                # in case they're still lingering on this position).
+                for flag in (
+                    'profit50_alerted_date', 'loss30_alerted_date', 'tgtpct_crossed_date',
+                    'ce_tgt_alerted_date', 'pe_tgt_alerted_date',
+                    'ce_tgt_alerted', 'pe_tgt_alerted', 'profit50_alerted', 'loss30_alerted',
+                ):
+                    pos.pop(flag, None)
+                save_positions(positions)
+                st.success(f"Saved S.no {sel_sno}")
+                st.rerun()
+            if delete_clicked:
+                positions = [p for p in positions if p['sno'] != sel_sno]
+                save_positions(positions)
+                st.success(f"Deleted S.no {sel_sno}")
+                st.rerun()
+    # ------------------------------------------------------------
     # Live LTP for every open leg
     # ------------------------------------------------------------
     all_keys = sorted({
@@ -640,6 +767,11 @@ def render_pnl_tab():
     # invest/profit) show two values per position (CE and PE) — clicking
     # one of those headers sorts by the CE leg's value; there's a tooltip
     # on those headers saying so.
+    #
+    # Each position (its CE + PE row pair) gets a DARK bottom border, so
+    # you can see at a glance where one position ends and the next begins
+    # — a light grey border on every row otherwise blurs one hedge into
+    # the next when many are open at once.
     # ------------------------------------------------------------
     def _leg_row_dict(p, lot, leg, lc, entry_date_str, exit_date_str, net_invest, net_profit, net_pct, tgt_pct):
         if not lc.get('taken', True):
@@ -694,6 +826,7 @@ def render_pnl_tab():
     initial_open = sorted((e for e in enriched if e['is_open']), key=lambda e: e['p']['sno'])
     initial_closed = sorted((e for e in enriched if not e['is_open']), key=lambda e: e['p']['sno'])
     initial_order = initial_open + initial_closed
+    POSITION_SEP = 'border-bottom:3px solid #333333;'
     body_blocks_html = []
     for pos_idx, e in enumerate(initial_order):
         p, leg_calc = e['p'], e['leg_calc']
@@ -748,35 +881,43 @@ def render_pnl_tab():
             profit_style = '' if closed_class else pnl_style(lc["profit"])
             net_profit_style = '' if closed_class else pnl_style(net_profit)
             exit_disp = f"{lc['exit']:.2f}" if lc['exit'] is not None else '—'
+            # The bottom border of the WHOLE position sits on: every rowspan
+            # cell (i==0, since a rowspan="2" cell's own bottom edge already
+            # is the position's bottom edge), and every ordinary cell in the
+            # LAST leg row (i==1, the PE row) — the CE row's own cells stay
+            # on the normal light grey border since the PE row still follows
+            # right underneath, within the same position.
+            last_leg_row = (i == 1)
+            leg_sep = POSITION_SEP if last_leg_row else ''
             cells = []
             if i == 0:
-                cells.append(f'<td rowspan="2" class="{band}">{p["sno"]}</td>')
-                cells.append(f'<td rowspan="2" class="{band}">{entry_date_str}</td>')
-                cells.append(f'<td rowspan="2" class="{band}{sym_extra}">{esc(p["symbol"])}</td>')
-                cells.append(f'<td rowspan="2" class="{band}">{lot}</td>')
+                cells.append(f'<td rowspan="2" class="{band}" style="{POSITION_SEP}">{p["sno"]}</td>')
+                cells.append(f'<td rowspan="2" class="{band}" style="{POSITION_SEP}">{entry_date_str}</td>')
+                cells.append(f'<td rowspan="2" class="{band}{sym_extra}" style="{POSITION_SEP}">{esc(p["symbol"])}</td>')
+                cells.append(f'<td rowspan="2" class="{band}" style="{POSITION_SEP}">{lot}</td>')
             if not lc.get('taken', True):
                 cells.append(
-                    f'<td class="{band}" colspan="10" style="color:#888;font-style:italic;background:#f2f2f2;">'
+                    f'<td class="{band}" colspan="10" style="color:#888;font-style:italic;background:#f2f2f2;{leg_sep}">'
                     f'{leg.upper()} leg not taken</td>'
                 )
             else:
-                cells.append(f'<td class="{band}">{lc["strike"]:.0f} {leg.upper()}</td>')
-                cells.append(f'<td class="{band}">{lc["qty"]}</td>')
-                cells.append(f'<td class="{band}{entry_extra}">{lc["entry"]:.2f}</td>')
-                cells.append(f'<td class="{band}" style="{ltp_style}">{lc["ltp"]:.2f}</td>')
-                cells.append(f'<td class="{band}">{lc["tgt"]:.2f}</td>')
-                cells.append(f'<td class="{band}">{lc["tgt_points"]:.2f}</td>')
-                cells.append(f'<td class="{band}{exit_extra}">{exit_disp}</td>')
-                cells.append(f'<td class="{band}" style="{points_style}">{lc["points"]:.2f}</td>')
-                cells.append(f'<td class="{band}">{lc["invest"]:,.0f}</td>')
-                cells.append(f'<td class="{band}" style="{profit_style}">{lc["profit"]:,.0f}</td>')
+                cells.append(f'<td class="{band}" style="{leg_sep}">{lc["strike"]:.0f} {leg.upper()}</td>')
+                cells.append(f'<td class="{band}" style="{leg_sep}">{lc["qty"]}</td>')
+                cells.append(f'<td class="{band}{entry_extra}" style="{leg_sep}">{lc["entry"]:.2f}</td>')
+                cells.append(f'<td class="{band}" style="{ltp_style}{leg_sep}">{lc["ltp"]:.2f}</td>')
+                cells.append(f'<td class="{band}" style="{leg_sep}">{lc["tgt"]:.2f}</td>')
+                cells.append(f'<td class="{band}" style="{leg_sep}">{lc["tgt_points"]:.2f}</td>')
+                cells.append(f'<td class="{band}{exit_extra}" style="{leg_sep}">{exit_disp}</td>')
+                cells.append(f'<td class="{band}" style="{points_style}{leg_sep}">{lc["points"]:.2f}</td>')
+                cells.append(f'<td class="{band}" style="{leg_sep}">{lc["invest"]:,.0f}</td>')
+                cells.append(f'<td class="{band}" style="{profit_style}{leg_sep}">{lc["profit"]:,.0f}</td>')
             if i == 0:
-                cells.append(f'<td rowspan="2" class="{band}">{net_invest:,.0f}</td>')
-                cells.append(f'<td rowspan="2" class="{band}" style="{net_profit_style}">{net_profit:,.0f}</td>')
-                cells.append(f'<td rowspan="2" class="{band}" style="{net_profit_style}">{net_pct:.1f}%</td>')
-                cells.append(f'<td rowspan="2" class="{band}">{tgt_pct:.1f}%</td>')
-                cells.append(f'<td rowspan="2" class="{band}">{exit_date_str}</td>')
-                cells.append(f'<td rowspan="2" class="{band}">{esc(p.get("remarks") or "")}</td>')
+                cells.append(f'<td rowspan="2" class="{band}" style="{POSITION_SEP}">{net_invest:,.0f}</td>')
+                cells.append(f'<td rowspan="2" class="{band}" style="{net_profit_style}{POSITION_SEP}">{net_profit:,.0f}</td>')
+                cells.append(f'<td rowspan="2" class="{band}" style="{net_profit_style}{POSITION_SEP}">{net_pct:.1f}%</td>')
+                cells.append(f'<td rowspan="2" class="{band}" style="{POSITION_SEP}">{tgt_pct:.1f}%</td>')
+                cells.append(f'<td rowspan="2" class="{band}" style="{POSITION_SEP}">{exit_date_str}</td>')
+                cells.append(f'<td rowspan="2" class="{band}" style="{POSITION_SEP}">{esc(p.get("remarks") or "")}</td>')
             rows.append('<tr>' + ''.join(cells) + '</tr>')
         body_blocks_html.append(
             f'<tbody data-open="{1 if e["is_open"] else 0}" data-vals="{vals_attr}">'
@@ -905,132 +1046,6 @@ def render_pnl_tab():
                 save_positions([])
                 st.success("Cleared.")
                 time.sleep(1)
-                st.rerun()
-    # ------------------------------------------------------------
-    # Close / edit a position — plain widgets, no grid editing. Collapsed
-    # by default (like Add Position) so the table above gets the vertical
-    # space instead of this form sitting open all the time. CE and PE are
-    # grouped into their own colored blocks (same colors as Add Position)
-    # so it's obvious at a glance which fields belong to which leg.
-    # ------------------------------------------------------------
-    with st.expander("✏️ Close / Edit a Position", expanded=False):
-        options = {f"S.no {p['sno']} — {p['symbol']}": p['sno'] for p in positions}
-        choice = st.selectbox("Position", options=list(options.keys()))
-        sel_sno = options[choice]
-        pos = next(p for p in positions if p['sno'] == sel_sno)
-        with st.form("edit_position_form"):
-            entry_date_edit_val = st.date_input(
-                "Entry Date",
-                value=pd.to_datetime(pos.get('entry_date')).date() if pos.get('entry_date') else get_ist_now().date()
-            )
-            leg_header("CE Leg", **CE_COLORS)
-            d1, d2, d3, d4, d5 = st.columns(5)
-            ce_strike_val = d1.number_input(
-                "CE Strike", min_value=0.0, step=0.5, format="%.1f",
-                value=float(pos.get('ce_strike') or 0.0)
-            )
-            ce_entry_val = d2.number_input(
-                "CE Entry", min_value=0.0, step=0.05, format="%.2f",
-                value=float(pos.get('ce_entry') or 0.0)
-            )
-            ce_qty_val = d3.number_input(
-                "CE Qty", min_value=1, step=1,
-                value=int(pos.get('ce_qty') or 1)
-            )
-            ce_tgt_val = d4.number_input(
-                "CE TGT", min_value=0.0, step=0.05, format="%.2f",
-                value=float(pos.get('ce_tgt') or 0.0)
-            )
-            ce_exit_val = d5.number_input(
-                "CE Exit", min_value=0.0, step=0.05, format="%.2f",
-                value=float(pos.get('ce_exit') or 0.0)
-            )
-            leg_header("PE Leg", **PE_COLORS)
-            e1, e2, e3, e4, e5 = st.columns(5)
-            pe_strike_val = e1.number_input(
-                "PE Strike", min_value=0.0, step=0.5, format="%.1f",
-                value=float(pos.get('pe_strike') or 0.0)
-            )
-            pe_entry_val = e2.number_input(
-                "PE Entry", min_value=0.0, step=0.05, format="%.2f",
-                value=float(pos.get('pe_entry') or 0.0)
-            )
-            pe_qty_val = e3.number_input(
-                "PE Qty", min_value=1, step=1,
-                value=int(pos.get('pe_qty') or 1)
-            )
-            pe_tgt_val = e4.number_input(
-                "PE TGT", min_value=0.0, step=0.05, format="%.2f",
-                value=float(pos.get('pe_tgt') or 0.0)
-            )
-            pe_exit_val = e5.number_input(
-                "PE Exit", min_value=0.0, step=0.05, format="%.2f",
-                value=float(pos.get('pe_exit') or 0.0)
-            )
-            st.markdown("---")
-            exit_date_val = st.date_input(
-                "Exit Date",
-                value=pd.to_datetime(pos['exit_date']).date() if pos.get('exit_date') else get_ist_now().date()
-            )
-            remarks_val = st.text_input("Remarks", value=pos.get('remarks') or '')
-            save_col, delete_col = st.columns(2)
-            save_clicked = save_col.form_submit_button("💾 Save", use_container_width=True)
-            delete_clicked = delete_col.form_submit_button("🗑️ Delete Position", use_container_width=True)
-            if save_clicked:
-                original_ce_strike = pos.get('ce_strike') or 0
-                original_pe_strike = pos.get('pe_strike') or 0
-                pos['entry_date'] = str(entry_date_edit_val)
-                pos['ce_strike'] = ce_strike_val
-                pos['pe_strike'] = pe_strike_val
-                pos['ce_entry'] = ce_entry_val
-                pos['pe_entry'] = pe_entry_val
-                pos['ce_qty'] = int(ce_qty_val)
-                pos['pe_qty'] = int(pe_qty_val)
-                pos['ce_tgt'] = ce_tgt_val
-                pos['pe_tgt'] = pe_tgt_val
-                pos['ce_exit'] = ce_exit_val if ce_exit_val > 0 else None
-                pos['pe_exit'] = pe_exit_val if pe_exit_val > 0 else None
-                pos['exit_date'] = str(exit_date_val) if (ce_exit_val > 0 or pe_exit_val > 0) else None
-                pos['remarks'] = remarks_val
-                # A corrected strike means the instrument key resolved earlier
-                # is for the WRONG contract and would keep showing that
-                # contract's LTP — re-resolve whichever leg's strike actually
-                # changed (only matters for a leg that's actually taken).
-                today_str = get_ist_now().strftime('%Y-%m-%d')
-                if pos['ce_entry'] > 0 and ce_strike_val != original_ce_strike:
-                    ce_key, ce_lot, ce_expiry = resolve_current_contract(pos['symbol'], ce_strike_val, "CE", today_str)
-                    pos['ce_instrument_key'] = ce_key
-                    if ce_lot:
-                        pos['lot_size'] = ce_lot
-                    if ce_expiry:
-                        pos['expiry'] = ce_expiry
-                    if not ce_key:
-                        st.warning("Couldn't match the new CE strike to a live contract — download NSE.json first.")
-                if pos['pe_entry'] > 0 and pe_strike_val != original_pe_strike:
-                    pe_key, pe_lot, pe_expiry = resolve_current_contract(pos['symbol'], pe_strike_val, "PE", today_str)
-                    pos['pe_instrument_key'] = pe_key
-                    if pe_lot and not pos.get('lot_size'):
-                        pos['lot_size'] = pe_lot
-                    if pe_expiry and not pos.get('expiry'):
-                        pos['expiry'] = pe_expiry
-                    if not pe_key:
-                        st.warning("Couldn't match the new PE strike to a live contract — download NSE.json first.")
-                # Numbers changed — let profit%/TGT% alerts re-evaluate today
-                # too (also clear old flag fields from earlier alert designs,
-                # in case they're still lingering on this position).
-                for flag in (
-                    'profit50_alerted_date', 'loss30_alerted_date', 'tgtpct_crossed_date',
-                    'ce_tgt_alerted_date', 'pe_tgt_alerted_date',
-                    'ce_tgt_alerted', 'pe_tgt_alerted', 'profit50_alerted', 'loss30_alerted',
-                ):
-                    pos.pop(flag, None)
-                save_positions(positions)
-                st.success(f"Saved S.no {sel_sno}")
-                st.rerun()
-            if delete_clicked:
-                positions = [p for p in positions if p['sno'] != sel_sno]
-                save_positions(positions)
-                st.success(f"Deleted S.no {sel_sno}")
                 st.rerun()
     if auto_refresh:
         # Do NOT use time.sleep() + st.rerun() here — that blocks the app's
