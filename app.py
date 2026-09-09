@@ -876,6 +876,15 @@ def render_pnl_tab():
             sym_extra = '' if closed_class else ' sym-cell'
             entry_extra = '' if closed_class else ' entry-cell'
             exit_extra = '' if closed_class else ' exit-cell'
+            # pnl_style() (and the inline tgt-hit highlight below) don't end
+            # in a semicolon — concatenating POSITION_SEP straight onto them
+            # merges into one malformed CSS token (e.g. "...700border-
+            # bottom:..."), which browsers silently drop, INCLUDING the
+            # border — that's what was causing the gaps in the separator
+            # line under colored cells. _css() guarantees a trailing ';' on
+            # every fragment before they're joined.
+            def _css(*parts):
+                return ''.join((p if p.endswith(';') else p + ';') for p in parts if p)
             ltp_style = '' if closed_class else ('background-color:#0b6623;color:#fff;font-weight:700' if lc['tgt_hit'] else '')
             points_style = '' if closed_class else pnl_style(lc["points"])
             profit_style = '' if closed_class else pnl_style(lc["profit"])
@@ -897,24 +906,24 @@ def render_pnl_tab():
                 cells.append(f'<td rowspan="2" class="{band}" style="{POSITION_SEP}">{lot}</td>')
             if not lc.get('taken', True):
                 cells.append(
-                    f'<td class="{band}" colspan="10" style="color:#888;font-style:italic;background:#f2f2f2;{leg_sep}">'
+                    f'<td class="{band}" colspan="10" style="{_css("color:#888", "font-style:italic", "background:#f2f2f2", leg_sep)}">'
                     f'{leg.upper()} leg not taken</td>'
                 )
             else:
                 cells.append(f'<td class="{band}" style="{leg_sep}">{lc["strike"]:.0f} {leg.upper()}</td>')
                 cells.append(f'<td class="{band}" style="{leg_sep}">{lc["qty"]}</td>')
                 cells.append(f'<td class="{band}{entry_extra}" style="{leg_sep}">{lc["entry"]:.2f}</td>')
-                cells.append(f'<td class="{band}" style="{ltp_style}{leg_sep}">{lc["ltp"]:.2f}</td>')
+                cells.append(f'<td class="{band}" style="{_css(ltp_style, leg_sep)}">{lc["ltp"]:.2f}</td>')
                 cells.append(f'<td class="{band}" style="{leg_sep}">{lc["tgt"]:.2f}</td>')
                 cells.append(f'<td class="{band}" style="{leg_sep}">{lc["tgt_points"]:.2f}</td>')
                 cells.append(f'<td class="{band}{exit_extra}" style="{leg_sep}">{exit_disp}</td>')
-                cells.append(f'<td class="{band}" style="{points_style}{leg_sep}">{lc["points"]:.2f}</td>')
+                cells.append(f'<td class="{band}" style="{_css(points_style, leg_sep)}">{lc["points"]:.2f}</td>')
                 cells.append(f'<td class="{band}" style="{leg_sep}">{lc["invest"]:,.0f}</td>')
-                cells.append(f'<td class="{band}" style="{profit_style}{leg_sep}">{lc["profit"]:,.0f}</td>')
+                cells.append(f'<td class="{band}" style="{_css(profit_style, leg_sep)}">{lc["profit"]:,.0f}</td>')
             if i == 0:
                 cells.append(f'<td rowspan="2" class="{band}" style="{POSITION_SEP}">{net_invest:,.0f}</td>')
-                cells.append(f'<td rowspan="2" class="{band}" style="{net_profit_style}{POSITION_SEP}">{net_profit:,.0f}</td>')
-                cells.append(f'<td rowspan="2" class="{band}" style="{net_profit_style}{POSITION_SEP}">{net_pct:.1f}%</td>')
+                cells.append(f'<td rowspan="2" class="{band}" style="{_css(net_profit_style, POSITION_SEP)}">{net_profit:,.0f}</td>')
+                cells.append(f'<td rowspan="2" class="{band}" style="{_css(net_profit_style, POSITION_SEP)}">{net_pct:.1f}%</td>')
                 cells.append(f'<td rowspan="2" class="{band}" style="{POSITION_SEP}">{tgt_pct:.1f}%</td>')
                 cells.append(f'<td rowspan="2" class="{band}" style="{POSITION_SEP}">{exit_date_str}</td>')
                 cells.append(f'<td rowspan="2" class="{band}" style="{POSITION_SEP}">{esc(p.get("remarks") or "")}</td>')
