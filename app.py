@@ -786,13 +786,28 @@ def render_pnl_tab():
     # currently tied up in OPEN legs exceeds it, flag a shortage right above
     # the metric blocks so it's the first thing you see.
     available_capital = total_capital - open_invest
+    if total_capital > 0:
+        avail_style = pnl_style(available_capital)
+        cap_table_html = f"""
+        <table style="border-collapse:collapse;font-size:14px;margin-bottom:4px;">
+        <tr>
+            <th style="background:#f4a261;color:#1a1a1a;font-weight:700;padding:6px 16px;border:1px solid #d0d0d0;">Capital</th>
+            <th style="background:#f4a261;color:#1a1a1a;font-weight:700;padding:6px 16px;border:1px solid #d0d0d0;">Invest</th>
+            <th style="background:#f4a261;color:#1a1a1a;font-weight:700;padding:6px 16px;border:1px solid #d0d0d0;">Available</th>
+        </tr>
+        <tr>
+            <td style="padding:6px 16px;border:1px solid #d0d0d0;text-align:center;">₹{total_capital:,.0f}</td>
+            <td style="padding:6px 16px;border:1px solid #d0d0d0;text-align:center;">₹{open_invest:,.0f}</td>
+            <td style="padding:6px 16px;border:1px solid #d0d0d0;text-align:center;{avail_style}">₹{available_capital:,.0f}</td>
+        </tr>
+        </table>
+        """
+        st.markdown(cap_table_html, unsafe_allow_html=True)
     if total_capital > 0 and open_invest > total_capital:
         st.error(
             f"⚠️ Capital Shortage — Open Legs Invest ₹{open_invest:,.0f} exceeds your Capital "
             f"₹{total_capital:,.0f} by ₹{open_invest - total_capital:,.0f}"
         )
-    elif total_capital > 0:
-        st.caption(f"Capital ₹{total_capital:,.0f} | Open Legs Invest ₹{open_invest:,.0f} | Available ₹{available_capital:,.0f}")
     metric_group("Closed Legs", closed_invest, closed_profit, closed_pct, '#1f6feb')
     metric_group("Open Legs", open_invest, open_profit, open_pct, '#e67e22')
     metric_group("Total", total_invest, total_profit, overall_pct, '#6f42c1')
