@@ -781,36 +781,43 @@ def render_pnl_tab():
         save_positions(positions)
     if alert_failures:
         st.warning("Telegram alert failed to send: " + "; ".join(alert_failures[:3]))
-    # --- Capital vs Open Legs Invest ---
-    # total_capital comes from the sidebar (persisted to disk). If what's
-    # currently tied up in OPEN legs exceeds it, flag a shortage right above
-    # the metric blocks so it's the first thing you see.
+    # --- Capital vs Open Legs Invest, side by side with the metric blocks ---
+    # total_capital comes from the sidebar (persisted to disk). The capital
+    # table is narrow, so the Closed/Open/Total metric blocks now sit in the
+    # wide space beside it instead of below it — no more empty gap to the
+    # right of the table.
     available_capital = total_capital - open_invest
-    if total_capital > 0:
-        avail_style = pnl_style(available_capital)
-        cap_table_html = f"""
-        <table style="border-collapse:collapse;font-size:14px;margin-bottom:4px;">
-        <tr>
-            <th style="background:#f4a261;color:#1a1a1a;font-weight:700;padding:6px 16px;border:1px solid #d0d0d0;">Capital</th>
-            <th style="background:#f4a261;color:#1a1a1a;font-weight:700;padding:6px 16px;border:1px solid #d0d0d0;">Invest</th>
-            <th style="background:#f4a261;color:#1a1a1a;font-weight:700;padding:6px 16px;border:1px solid #d0d0d0;">Available</th>
-        </tr>
-        <tr>
-            <td style="padding:6px 16px;border:1px solid #d0d0d0;text-align:center;">₹{total_capital:,.0f}</td>
-            <td style="padding:6px 16px;border:1px solid #d0d0d0;text-align:center;">₹{open_invest:,.0f}</td>
-            <td style="padding:6px 16px;border:1px solid #d0d0d0;text-align:center;{avail_style}">₹{available_capital:,.0f}</td>
-        </tr>
-        </table>
-        """
-        st.markdown(cap_table_html, unsafe_allow_html=True)
-    if total_capital > 0 and open_invest > total_capital:
-        st.error(
-            f"⚠️ Capital Shortage — Open Legs Invest ₹{open_invest:,.0f} exceeds your Capital "
-            f"₹{total_capital:,.0f} by ₹{open_invest - total_capital:,.0f}"
-        )
-    metric_group("Closed Legs", closed_invest, closed_profit, closed_pct, '#1f6feb')
-    metric_group("Open Legs", open_invest, open_profit, open_pct, '#e67e22')
-    metric_group("Total", total_invest, total_profit, overall_pct, '#6f42c1')
+    cap_col, metrics_col = st.columns([1, 3])
+    with cap_col:
+        if total_capital > 0:
+            avail_style = pnl_style(available_capital)
+            cap_table_html = f"""
+            <table style="border-collapse:collapse;font-size:14px;margin-bottom:4px;">
+            <tr>
+                <th style="background:#f4a261;color:#1a1a1a;font-weight:700;padding:6px 16px;border:1px solid #d0d0d0;">Capital</th>
+                <th style="background:#f4a261;color:#1a1a1a;font-weight:700;padding:6px 16px;border:1px solid #d0d0d0;">Invest</th>
+                <th style="background:#f4a261;color:#1a1a1a;font-weight:700;padding:6px 16px;border:1px solid #d0d0d0;">Available</th>
+            </tr>
+            <tr>
+                <td style="padding:6px 16px;border:1px solid #d0d0d0;text-align:center;">₹{total_capital:,.0f}</td>
+                <td style="padding:6px 16px;border:1px solid #d0d0d0;text-align:center;">₹{open_invest:,.0f}</td>
+                <td style="padding:6px 16px;border:1px solid #d0d0d0;text-align:center;{avail_style}">₹{available_capital:,.0f}</td>
+            </tr>
+            </table>
+            """
+            st.markdown(cap_table_html, unsafe_allow_html=True)
+            if open_invest > total_capital:
+                st.error(
+                    f"⚠️ Capital Shortage — exceeds by ₹{open_invest - total_capital:,.0f}"
+                )
+    with metrics_col:
+        # Streamlit only supports one level of nested columns, and cap_col /
+        # metrics_col is already that level — so these three stack in a
+        # single column here rather than adding a second nested row of
+        # columns (which Streamlit would reject).
+        metric_group("Closed Legs", closed_invest, closed_profit, closed_pct, '#1f6feb')
+        metric_group("Open Legs", open_invest, open_profit, open_pct, '#e67e22')
+        metric_group("Total", total_invest, total_profit, overall_pct, '#6f42c1')
     # ------------------------------------------------------------
     # Interactive table — every column header is clickable to sort (click
     # again to reverse), plus an instant search box. Both run entirely in
