@@ -45,6 +45,7 @@ TOKEN_FILE = os.path.join(DATA_DIR, 'token.json')
 LTP_CACHE_FILE = os.path.join(DATA_DIR, 'ltp_cache.json')
 TELEGRAM_CONFIG_FILE = os.path.join(DATA_DIR, 'telegram_config.json')
 AUTO_REFRESH_CONFIG_FILE = os.path.join(DATA_DIR, 'auto_refresh_config.json')
+CAPITAL_CONFIG_FILE = os.path.join(DATA_DIR, 'capital_config.json')
 NSE_JSON_PATH = 'NSE.json'
 # ============================================================
 # Token
@@ -85,6 +86,24 @@ def load_auto_refresh_config():
 def save_auto_refresh_config(cfg):
     try:
         with open(AUTO_REFRESH_CONFIG_FILE, 'w') as f:
+            json.dump(cfg, f)
+    except Exception:
+        pass
+# ============================================================
+# Capital — persisted the same way (see note above): a plain widget
+# would also reset to its default on every auto-refresh page reload.
+# ============================================================
+def load_capital_config():
+    if os.path.exists(CAPITAL_CONFIG_FILE):
+        try:
+            with open(CAPITAL_CONFIG_FILE, 'r') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {'capital': 500000}
+def save_capital_config(cfg):
+    try:
+        with open(CAPITAL_CONFIG_FILE, 'w') as f:
             json.dump(cfg, f)
     except Exception:
         pass
@@ -271,6 +290,16 @@ with st.sidebar:
     access_token = st.text_input("Upstox Access Token", value=saved_token, type="password")
     if access_token and access_token != saved_token:
         save_token(access_token)
+    st.markdown("---")
+    st.header("Capital")
+    cap_cfg = load_capital_config()
+    total_capital = st.number_input(
+        "Total Capital (₹)", min_value=0, step=10000,
+        value=int(cap_cfg.get('capital', 500000)),
+        help="e.g. 500000 or 1000000. If your open legs' invested amount exceeds this, a capital shortage warning shows on the PNL tab."
+    )
+    if total_capital != cap_cfg.get('capital', 500000):
+        save_capital_config({'capital': total_capital})
     st.markdown("---")
     st.subheader("NSE Instrument JSON")
     st.caption(f"{'✅ Found' if os.path.exists(NSE_JSON_PATH) else '❌ Missing'}: {NSE_JSON_PATH} (needed only to open new positions)")
@@ -752,6 +781,18 @@ def render_pnl_tab():
         save_positions(positions)
     if alert_failures:
         st.warning("Telegram alert failed to send: " + "; ".join(alert_failures[:3]))
+    # --- Capital vs Open Legs Invest ---
+    # total_capital comes from the sidebar (persisted to disk). If what's
+    # currently tied up in OPEN legs exceeds it, flag a shortage right above
+    # the metric blocks so it's the first thing you see.
+    available_capital = total_capital - open_invest
+    if total_capital > 0 and open_invest > total_capital:
+        st.error(
+            f"⚠️ Capital Shortage — Open Legs Invest ₹{open_invest:,.0f} exceeds your Capital "
+            f"₹{total_capital:,.0f} by ₹{open_invest - total_capital:,.0f}"
+        )
+    elif total_capital > 0:
+        st.caption(f"Capital ₹{total_capital:,.0f} | Open Legs Invest ₹{open_invest:,.0f} | Available ₹{available_capital:,.0f}")
     metric_group("Closed Legs", closed_invest, closed_profit, closed_pct, '#1f6feb')
     metric_group("Open Legs", open_invest, open_profit, open_pct, '#e67e22')
     metric_group("Total", total_invest, total_profit, overall_pct, '#6f42c1')
