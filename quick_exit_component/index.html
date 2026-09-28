@@ -9,7 +9,7 @@
   </style>
 </head>
 <body>
-  <div id="root"></div>
+  <div id="root">Loading positions...</div>
   <script>
     (function () {
       var root = document.getElementById("root");
@@ -23,7 +23,11 @@
       }
 
       function render(args) {
-        root.innerHTML = args.html || "";
+        if (typeof args.html !== "string") {
+          root.textContent = "Position table data was not received. Reload the app.";
+          return;
+        }
+        root.innerHTML = args.html;
         root.querySelectorAll("script").forEach(function (oldScript) {
           var script = document.createElement("script");
           Array.from(oldScript.attributes).forEach(function (attribute) {
@@ -37,7 +41,7 @@
 
       window.addEventListener("message", function (event) {
         var message = event.data || {};
-        if (message.isStreamlitMessage && message.type === "streamlit:render") {
+        if (message.type === "streamlit:render") {
           render(message.args || {});
         }
       });
