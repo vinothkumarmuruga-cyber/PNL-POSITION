@@ -818,6 +818,54 @@ def render_pnl_tab():
         metric_group("Closed Legs", closed_invest, closed_profit, closed_pct, '#1f6feb')
         metric_group("Open Legs", open_invest, open_profit, open_pct, '#e67e22')
         metric_group("Total", total_invest, total_profit, overall_pct, '#6f42c1')
+    # Streamlit widgets cannot be embedded in the HTML table iframe. Keep
+    # one native, actionable button per open position immediately above it.
+    open_positions = [e for e in enriched if e['is_open']]
+    if open_positions:
+        st.markdown("#### Quick Exit at Current LTP")
+        exit_button_cols = st.columns(min(4, len(open_positions)))
+        for pos_idx, e in enumerate(open_positions):
+            p = e['p']
+            button_col = exit_button_cols[pos_idx % len(exit_button_cols)]
+            with button_col:
+                if st.button(
+                    f"Exit #{p['sno']} {p['symbol']}",
+                    key=f"quick_exit_{p['sno']}",
+                    use_container_width=True,
+                ):
+                    if not access_token:
+                        st.error("Enter your Upstox Access Token before exiting at live LTP.")
+                    else:
+                        open_legs_for_exit = [
+                            leg for leg in ('ce', 'pe')
+                            if float(p.get(f'{leg}_entry') or 0) > 0
+                            and p.get(f'{leg}_exit') in (None, '')
+                        ]
+                        exit_keys = [
+                            p.get(f'{leg}_instrument_key') for leg in open_legs_for_exit
+                            if p.get(f'{leg}_instrument_key')
+                        ]
+                        fresh_prices = fetch_ltp(exit_keys, access_token)
+                        missing_legs = [
+                            leg for leg in open_legs_for_exit
+                            if not p.get(f'{leg}_instrument_key')
+                            or float(fresh_prices.get(p.get(f'{leg}_instrument_key'), 0) or 0) <= 0
+                        ]
+                        if missing_legs:
+                            st.error(
+                                "Could not fetch a fresh LTP for "
+                                + ", ".join(leg.upper() for leg in missing_legs)
+                                + ". Position is still open; refresh the quote and try again."
+                            )
+                        else:
+                            exit_now = get_ist_now()
+                            for leg in open_legs_for_exit:
+                                inst_key = p.get(f'{leg}_instrument_key')
+                                p[f'{leg}_exit'] = float(fresh_prices[inst_key])
+                            p['exit_date'] = exit_now.strftime('%Y-%m-%d')
+                            p['exit_time'] = exit_now.strftime('%H:%M:%S')
+                            save_positions(positions)
+                            st.rerun()
     # ------------------------------------------------------------
     # Interactive table — every column header is clickable to sort (click
     # again to reverse), plus an instant search box. Both run entirely in
