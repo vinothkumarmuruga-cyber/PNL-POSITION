@@ -770,8 +770,6 @@ def render_pnl_tab():
         exit_date_parsed = pd.to_datetime(p.get('exit_date'), errors='coerce')
         entry_date_str = entry_date_parsed.strftime('%d-%m-%Y') if pd.notna(entry_date_parsed) else '—'
         exit_date_str = exit_date_parsed.strftime('%d-%m-%Y') if pd.notna(exit_date_parsed) else '—'
-        if pd.notna(exit_date_parsed) and p.get('exit_time'):
-            exit_date_str += f" {p['exit_time']}"
         enriched.append({
             'p': p, 'leg_calc': leg_calc,
             'net_invest': net_invest, 'net_profit': net_profit, 'net_pct': net_pct,
@@ -1187,7 +1185,6 @@ def render_pnl_tab():
                         inst_key = position_to_exit.get(f'{leg}_instrument_key')
                         position_to_exit[f'{leg}_exit'] = float(fresh_prices[inst_key])
                     position_to_exit['exit_date'] = exit_now.strftime('%Y-%m-%d')
-                    position_to_exit['exit_time'] = exit_now.strftime('%H:%M:%S')
                     save_positions(positions)
                     st.rerun()
     # ------------------------------------------------------------
