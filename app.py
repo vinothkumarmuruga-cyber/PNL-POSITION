@@ -11,6 +11,9 @@ import concurrent.futures
 import html as html_lib
 import io
 from datetime import datetime
+from openpyxl import load_workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 from storage import (
     get_ist_now, DATA_DIR, PERSISTENCE_CONFIGURED,
     load_positions, save_positions, next_sno, esc, pnl_style,
@@ -1026,10 +1029,12 @@ def render_pnl_tab():
         p, leg_calc = e['p'], e['leg_calc']
         lot = p.get('lot_size') or 0
         for leg in ('ce', 'pe'):
-            export_rows.append(_leg_row_dict(
+            export_row = _leg_row_dict(
                 p, lot, leg, leg_calc[leg], e['entry_date_str'], e['exit_date_str'],
                 e['net_invest'], e['net_profit'], e['net_pct'], e['tgt_pct']
-            ))
+            )
+            export_row['Exit'] = 'Exit' if e['is_open'] else '—'
+            export_rows.append(export_row)
     st.caption(f"Last Updated: {get_ist_now().strftime('%H:%M:%S')} IST")
     table_page_html = f"""
     <style>
@@ -1192,8 +1197,136 @@ def render_pnl_tab():
     # ------------------------------------------------------------
     dl_col, clear_col = st.columns(2)
     with dl_col:
+        export_columns = [column[0] for column in TABLE_COLUMNS]
+        export_df = pd.DataFrame(export_rows, columns=export_columns)
+        raw_buf = io.BytesIO()
+        export_df.to_excel(raw_buf, index=False, sheet_name='Positions', engine='openpyxl')
+        raw_buf.seek(0)
+        workbook = load_workbook(raw_buf)
+        worksheet = workbook['Positions']
+        worksheet.sheet_view.showGridLines = False
+        worksheet.freeze_panes = 'E2'
+
+        orange = PatternFill('solid', fgColor='F4A261')
+        green_row = PatternFill('solid', fgColor='D4EDDA')
+        red_row = PatternFill('solid', fgColor='F8D7DA')
+        band_a = PatternFill('solid', fgColor='FFFFFF')
+        band_b = PatternFill('solid', fgColor='F7F9FB')
+        blue_symbol = PatternFill('solid', fgColor='DBEEFF')
+        green_entry = PatternFill('solid', fgColor='C6EFCE')
+        yellow_exit = PatternFill('solid', fgColor='FFEB9C')
+        green_pnl = PatternFill('solid', fgColor='D4EDDA')
+        red_pnl = PatternFill('solid', fgColor='F8D7DA')
+        thin = Side(style='thin', color='D0D0D0')
+        position_bottom = Side(style='medium', color='333333')
+        centered = Alignment(horizontal='center', vertical='center')
+        headers = {cell.value: cell.column for cell in worksheet[1]}
+        shared_columns = (
+            'S.no', 'Entry Date', 'SYMBOL', 'lot Size', 'Net Invest', 'Net Profit',
+            'profit%', 'TGT %', 'Exit', 'Exit Date', 'remarks',
+        )
+
+        for cell in worksheet[1]:
+            cell.fill = orange
+            cell.font = Font(name='Arial', size=10, bold=True, color='1A1A1A')
+            cell.alignment = centered
+            cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+        worksheet.row_dimensions[1].height = 26
+
+        for position_index, item in enumerate(initial_order):
+            first_row = 2 + position_index * 2
+            last_row = first_row + 1
+            is_open = item['is_open']
+            net_profit_value = item['net_profit']
+            if not is_open:
+                position_fill = green_row if net_profit_value > 0 else red_row
+            else:
+                position_fill = band_b if position_index % 2 else band_a
+
+            for row_number in (first_row, last_row):
+                bottom = position_bottom if row_number == last_row else thin
+                for cell in worksheet[row_number]:
+                    cell.fill = position_fill
+                    cell.font = Font(name='Arial', size=10, color='111111')
+                    cell.alignment = centered
+                    cell.border = Border(left=thin, right=thin, top=thin, bottom=bottom)
+                worksheet.row_dimensions[row_number].height = 21
+
+            if is_open:
+                worksheet.cell(first_row, headers['SYMBOL']).fill = blue_symbol
+                worksheet.cell(first_row, headers['SYMBOL']).font = Font(
+                    name='Arial', size=10, bold=True, color='0B3D91'
+                )
+                for leg_offset, leg in enumerate(('ce', 'pe')):
+                    row_number = first_row + leg_offset
+                    leg_info = item['leg_calc'][leg]
+                    if not leg_info['taken']:
+                        continue
+                    entry_cell = worksheet.cell(row_number, headers['entry'])
+                    entry_cell.fill = green_entry
+                    entry_cell.font = Font(name='Arial', size=10, bold=True, color='111111')
+                    worksheet.cell(row_number, headers['exit']).fill = yellow_exit
+                    if leg_info['tgt_hit']:
+                        target_cell = worksheet.cell(row_number, headers['LTP'])
+                        target_cell.fill = PatternFill('solid', fgColor='0B6623')
+                        target_cell.font = Font(name='Arial', size=10, bold=True, color='FFFFFF')
+                    for column_name, value in (
+                        ('points', leg_info['points']),
+                        ('profit', leg_info['profit']),
+                    ):
+                        cell = worksheet.cell(row_number, headers[column_name])
+                        cell.fill = green_pnl if value > 0 else red_pnl if value < 0 else position_fill
+                        cell.font = Font(
+                            name='Arial', size=10, bold=True,
+                            color='0B6623' if value > 0 else 'B42318' if value < 0 else '111111',
+                        )
+                pnl_fill = green_pnl if net_profit_value > 0 else red_pnl if net_profit_value < 0 else position_fill
+                for column_name in ('Net Profit', 'profit%'):
+                    cell = worksheet.cell(first_row, headers[column_name])
+                    cell.fill = pnl_fill
+                    cell.font = Font(
+                        name='Arial', size=10, bold=True,
+                        color='0B6623' if net_profit_value > 0 else 'B42318' if net_profit_value < 0 else '111111',
+                    )
+                worksheet.cell(first_row, headers['Exit']).fill = yellow_exit
+
+            for column_name in shared_columns:
+                column_number = headers[column_name]
+                worksheet.merge_cells(
+                    start_row=first_row, start_column=column_number,
+                    end_row=last_row, end_column=column_number,
+                )
+                merged_cell = worksheet.cell(first_row, column_number)
+                merged_cell.alignment = centered
+                merged_cell.border = Border(
+                    left=thin, right=thin, top=thin, bottom=position_bottom
+                )
+
+        for row in worksheet.iter_rows(min_row=2):
+            for cell in row:
+                if cell.value is not None and isinstance(cell.value, (int, float)):
+                    if cell.column in (headers['profit%'], headers['TGT %']):
+                        cell.number_format = '0.0"%"'
+                    elif cell.column in (headers['Qty'], headers['lot Size']):
+                        cell.number_format = '#,##0'
+                    elif cell.column in (headers['invest'], headers['profit'], headers['Net Invest'], headers['Net Profit']):
+                        cell.number_format = '#,##0;[Red]-#,##0'
+                    elif cell.column in (
+                        headers['entry'], headers['LTP'], headers['TGT'], headers['TGT Points'],
+                        headers['exit'], headers['points'],
+                    ):
+                        cell.number_format = '0.00'
+        column_widths = [9, 14, 16, 10, 13, 7, 10, 10, 10, 13, 10, 10, 12, 12, 14, 13, 10, 10, 10, 15, 24]
+        for column_number, width in enumerate(column_widths, start=1):
+            worksheet.column_dimensions[get_column_letter(column_number)].width = width
+        worksheet.sheet_properties.pageSetUpPr.fitToPage = True
+        worksheet.page_setup.orientation = 'landscape'
+        worksheet.page_setup.fitToWidth = 1
+        worksheet.page_setup.fitToHeight = 0
+
         export_buf = io.BytesIO()
-        pd.DataFrame(export_rows).to_excel(export_buf, index=False, sheet_name='Positions', engine='openpyxl')
+        workbook.save(export_buf)
+        export_buf.seek(0)
         st.download_button(
             "⬇️ Download as Excel",
             data=export_buf.getvalue(),
