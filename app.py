@@ -47,6 +47,10 @@ TELEGRAM_CONFIG_FILE = os.path.join(DATA_DIR, 'telegram_config.json')
 AUTO_REFRESH_CONFIG_FILE = os.path.join(DATA_DIR, 'auto_refresh_config.json')
 CAPITAL_CONFIG_FILE = os.path.join(DATA_DIR, 'capital_config.json')
 NSE_JSON_PATH = 'NSE.json'
+quick_exit_table = components.declare_component(
+    "quick_exit_table",
+    path=os.path.join(os.path.dirname(__file__), "quick_exit_component"),
+)
 # ============================================================
 # Token
 # ============================================================
@@ -400,7 +404,6 @@ def render_pnl_tab():
         st.write("")
         manual_refresh_clicked = st.button("🔄 Refresh", use_container_width=True, key="pnl_refresh_btn")
     positions = load_positions()
-    requested_exit_sno = st.query_params.get("quick_exit")
     # ------------------------------------------------------------
     # Open a new position
     # ------------------------------------------------------------
@@ -632,49 +635,6 @@ def render_pnl_tab():
         st.warning("Enter your Upstox Access Token in the sidebar to see live LTP.")
     def leg_ltp(inst_key):
         return float(ltp_cache.get(inst_key, 0.0)) if inst_key else 0.0
-    if requested_exit_sno is not None:
-        st.query_params.pop("quick_exit", None)
-        try:
-            requested_exit_sno = int(requested_exit_sno)
-        except (TypeError, ValueError):
-            requested_exit_sno = None
-        position_to_exit = next(
-            (p for p in positions if p.get('sno') == requested_exit_sno), None
-        )
-        if position_to_exit is not None and access_token:
-            open_legs_for_exit = [
-                leg for leg in ('ce', 'pe')
-                if float(position_to_exit.get(f'{leg}_entry') or 0) > 0
-                and position_to_exit.get(f'{leg}_exit') in (None, '')
-            ]
-            exit_keys = [
-                position_to_exit.get(f'{leg}_instrument_key')
-                for leg in open_legs_for_exit
-                if position_to_exit.get(f'{leg}_instrument_key')
-            ]
-            fresh_prices = fetch_ltp(exit_keys, access_token)
-            missing_legs = [
-                leg for leg in open_legs_for_exit
-                if not position_to_exit.get(f'{leg}_instrument_key')
-                or float(fresh_prices.get(position_to_exit.get(f'{leg}_instrument_key'), 0) or 0) <= 0
-            ]
-            if open_legs_for_exit and not missing_legs:
-                exit_now = get_ist_now()
-                for leg in open_legs_for_exit:
-                    inst_key = position_to_exit.get(f'{leg}_instrument_key')
-                    position_to_exit[f'{leg}_exit'] = float(fresh_prices[inst_key])
-                position_to_exit['exit_date'] = exit_now.strftime('%Y-%m-%d')
-                position_to_exit['exit_time'] = exit_now.strftime('%H:%M:%S')
-                save_positions(positions)
-                st.rerun()
-            elif missing_legs:
-                st.error(
-                    "Could not fetch fresh LTP for "
-                    + ", ".join(leg.upper() for leg in missing_legs)
-                    + ". Position remains open."
-                )
-        elif position_to_exit is not None:
-            st.error("Enter your Upstox Access Token before exiting at live LTP.")
     # ------------------------------------------------------------
     # Build the display table — spreadsheet-style: one row PER LEG (CE, PE)
     # like the original Excel sheet, with the shared fields (S.no, Entry
@@ -1124,9 +1084,16 @@ def render_pnl_tab():
         var table = document.getElementById('pnlTable');
         var currentSort = {{ key: null, dir: 1 }};
         window.quickExit = function(sno) {{
-            var parentUrl = new URL(window.parent.location.href);
-            parentUrl.searchParams.set('quick_exit', String(sno));
-            window.parent.location.href = parentUrl.toString();
+            window._quickExitClickCount = (window._quickExitClickCount || 0) + 1;
+            window.parent.postMessage({{
+                isStreamlitMessage: true,
+                type: 'streamlit:setComponentValue',
+                value: {{
+                    sno: Number(sno),
+                    request_id: Date.now() + ':' + window._quickExitClickCount
+                }},
+                dataType: 'json'
+            }}, '*');
         }};
         function cmp(a, b) {{
             if (a === null || a === undefined) a = -Infinity;
@@ -1167,7 +1134,59 @@ def render_pnl_tab():
     }})();
     </script>
     """
-    components.html(table_page_html, height=1130, scrolling=True)
+    exit_request = quick_exit_table(
+        html=table_page_html,
+        height=1130,
+        default=None,
+        key="positions_table_component",
+    )
+    exit_sno = None
+    if isinstance(exit_request, dict):
+        request_id = exit_request.get('request_id')
+        if request_id and st.session_state.get('_processed_exit_request') != request_id:
+            st.session_state['_processed_exit_request'] = request_id
+            exit_sno = exit_request.get('sno')
+    if exit_sno not in (None, ""):
+        try:
+            exit_sno = int(exit_sno)
+        except (TypeError, ValueError):
+            exit_sno = None
+        position_to_exit = next((p for p in positions if p.get('sno') == exit_sno), None)
+        if position_to_exit is not None:
+            open_legs_for_exit = [
+                leg for leg in ('ce', 'pe')
+                if float(position_to_exit.get(f'{leg}_entry') or 0) > 0
+                and position_to_exit.get(f'{leg}_exit') in (None, '')
+            ]
+            if open_legs_for_exit and not access_token:
+                st.error("Enter your Upstox Access Token before exiting at live LTP.")
+            elif open_legs_for_exit:
+                exit_keys = [
+                    position_to_exit.get(f'{leg}_instrument_key')
+                    for leg in open_legs_for_exit
+                    if position_to_exit.get(f'{leg}_instrument_key')
+                ]
+                fresh_prices = fetch_ltp(exit_keys, access_token)
+                missing_legs = [
+                    leg for leg in open_legs_for_exit
+                    if not position_to_exit.get(f'{leg}_instrument_key')
+                    or float(fresh_prices.get(position_to_exit.get(f'{leg}_instrument_key'), 0) or 0) <= 0
+                ]
+                if missing_legs:
+                    st.error(
+                        "Could not fetch fresh LTP for "
+                        + ", ".join(leg.upper() for leg in missing_legs)
+                        + ". Position remains open."
+                    )
+                else:
+                    exit_now = get_ist_now()
+                    for leg in open_legs_for_exit:
+                        inst_key = position_to_exit.get(f'{leg}_instrument_key')
+                        position_to_exit[f'{leg}_exit'] = float(fresh_prices[inst_key])
+                    position_to_exit['exit_date'] = exit_now.strftime('%Y-%m-%d')
+                    position_to_exit['exit_time'] = exit_now.strftime('%H:%M:%S')
+                    save_positions(positions)
+                    st.rerun()
     # ------------------------------------------------------------
     # Excel download + clear-all
     # ------------------------------------------------------------
